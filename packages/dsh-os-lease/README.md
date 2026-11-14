@@ -35,7 +35,7 @@ when agents must share one workspace safely.
 
 ## Install
 
-The package is **not published yet**. From this monorepo:
+The package is **published as `dsh-os-lease@0.1.1`**. From npm:
 
 ```sh
 npm install

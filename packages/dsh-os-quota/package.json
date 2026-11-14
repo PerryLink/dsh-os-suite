@@ -1,6 +1,6 @@
 {
   "name": "dsh-os-quota",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Advisory token, job and disk budgets with admission decisions for DSH agents.",
   "type": "module",
   "license": "Apache-2.0",

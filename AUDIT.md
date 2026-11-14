@@ -481,6 +481,24 @@ done
 
 **复验**：`npm test` 90/90；每个包 `node --check` 通过；smoke import 6 个入口均导出 `name/inject/apply` 并注册 21 个工具；命名复核 npm E404、GitHub total_count 0。
 
-**结论更新**：三条审计问题已修复，可进入“隔离 DSH_HOME 安装验证 → npm publish --dry-run → 发布”阶段；发布本身尚未执行。
+**结论更新**：审计问题与 P2/P3 均已处理；0.1.0 已发布，0.1.1 为修正 README 状态后的发布版本。见文末“发布记录”。
 
 **真实安装验证（lead，2026-11-14 17:45 +08）**：在临时 `DSH_HOME`（`mktemp -d`，未触碰用户 profile）中，用 `npx @deepseek-ai/dsh@0.2.2-rc.3 plugin --profile web add` 安装六个 tarball，全部成功；`dsh --profile web --dump-config` 输出六条 `# == dsh-os-*` 条目。peer dependency 警告仍在（B9，P2），但不阻塞安装。
+
+---
+
+## 发布记录（2026-11-14 17:55 +08）
+
+| 包 | npm 版本 | 链接 |
+|---|---|---|
+| dsh-os-trace | 0.1.1 | https://www.npmjs.com/package/dsh-os-trace |
+| dsh-os-lease | 0.1.1 | https://www.npmjs.com/package/dsh-os-lease |
+| dsh-os-quota | 0.1.1 | https://www.npmjs.com/package/dsh-os-quota |
+| dsh-os-eval | 0.1.1 | https://www.npmjs.com/package/dsh-os-eval |
+| dsh-os-catalog | 0.1.1 | https://www.npmjs.com/package/dsh-os-catalog |
+| dsh-os-registry | 0.1.1 | https://www.npmjs.com/package/dsh-os-registry |
+
+- GitHub monorepo: https://github.com/PerryLink/dsh-os-suite
+- 0.1.0 首发的 README 仍写“not published yet”；0.1.1 已修正状态并补 npm 安装命令。
+- npm 新包首发会短暂出现 `0.0.0-stage` 占位版本（npm staged processing），数分钟后 `0.1.0` 正常可见；不是发布失败。
+- 发布账号：`perrylink`；包 owner：`perrylink`。

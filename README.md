@@ -3,7 +3,7 @@
 Six small, composable **governance-layer** plugins for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH).
 
 > **Community project. Not affiliated with, sponsored by, or endorsed by DeepSeek.**
-> Apache-2.0. No SLA, no warranty. Early MVP (0.1.0), not published yet.
+> Apache-2.0. No SLA, no warranty. Early MVP, published as `0.1.1` on npm (2026-11-14).
 
 DSH already has the organs of an agent OS — sessions, tools, agent loop, sandbox, approvals, jobs, teams, worktrees, MCP. What it lacks is the **nervous system**: who is running, what they consume, why something happened, how to resume after a crash, what can do X, and whether a change made things worse. These six packages target that layer, not another UI skin or file search.
 
@@ -25,7 +25,18 @@ DSH already has the organs of an agent OS — sessions, tools, agent loop, sandb
 - **Names verified**: `npm view <name>` → E404; GitHub exact-name search → 0 (2026-11-14). See [NAME-CHECK.md](NAME-CHECK.md).
 - **Pre-release audit**: [AUDIT.md](AUDIT.md); three findings fixed (Apache-2.0 LICENSE, description accuracy, read-only `quota_status`).
 - **Real install verified** in an isolated `DSH_HOME`: all six tarballs install via `dsh plugin --profile web add`, and `--dump-config` lists all six entries.
-- **Not published**. Next step: `npm publish --dry-run`, then publish.
+- **Published**: all six packages at `0.1.1` on npm (2026-11-14).
+
+## Install
+
+```sh
+dsh plugin --profile web add dsh-os-trace
+dsh plugin --profile web add dsh-os-lease
+dsh plugin --profile web add dsh-os-quota
+dsh plugin --profile web add dsh-os-eval
+dsh plugin --profile web add dsh-os-catalog
+dsh plugin --profile web add dsh-os-registry
+```
 
 ## Quick start
 

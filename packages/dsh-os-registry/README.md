@@ -7,7 +7,7 @@
 >
 > Local service and port registry for dev servers started by DSH agents.
 
-**状态：0.1.0（MVP，尚未发布到 npm）。** 社区项目，非 DeepSeek 官方项目，Apache-2.0，无 SLA。
+**状态：0.1.1（MVP，已发布到 npm）。** 社区项目，非 DeepSeek 官方项目，Apache-2.0，无 SLA。
 
 ## 为什么
 

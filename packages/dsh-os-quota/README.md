@@ -6,7 +6,7 @@
 
 `dsh-os-quota` adds the missing "resource governor" primitive to a DeepSeek Harness (DSH) deployment: one small ledger per scope (session, agent, team, sandbox — your choice of id), three budgets, and a policy answer to *"may this work start?"* — not just a meter that tells you later what it cost.
 
-- Status: **0.1.0 MVP, not published to npm yet** (name verified free on 2026-11-14).
+- Status: **0.1.1 MVP, published to npm** (name verified free on 2026-11-14).
 - Runtime: pure ESM JavaScript, Node 24+, no build step, no `@deepseek-ai/*` imports in `src/core.js`.
 - Tests: `node --test` (21 tests, offline, injectable clock).
 
