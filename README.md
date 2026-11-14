@@ -1,5 +1,7 @@
 # dsh-os-suite
 
+[Security](SECURITY.md) · [Contributing](CONTRIBUTING.md) · [Changelog](CHANGELOG.md)
+
 Six small, composable **governance-layer** plugins for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH).
 
 > **Community project. Not affiliated with, sponsored by, or endorsed by DeepSeek.**

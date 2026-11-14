@@ -1,0 +1,136 @@
+# Publish dsh-os-suite to npm with provenance when a v* tag is pushed.
+#
+# The suite is versioned in lockstep: every package under packages/* must carry
+# the same version as the tag. Publishing uses npm workspaces so all six
+# tarballs are produced from the same verified commit.
+#
+# Provenance: `npm publish --provenance` attaches a sigstore attestation that
+# binds each tarball to this repository, commit and workflow run, and makes the
+# attestation visible via the registry (npm view <pkg>@<version> dist.attestations).
+# It requires `id-token: write`; the workflow only needs read access to contents.
+#
+# Token model (transitional): publishing authenticates with secrets.NPM_TOKEN.
+# TODO: migrate to npm Trusted Publishing (OIDC) and delete the secret:
+#   npmjs.com -> each package -> Settings -> Trusted Publishing -> GitHub Actions
+#   repository PerryLink/dsh-os-suite, workflow file release.yml
+# Then remove NODE_AUTH_TOKEN / secrets.NPM_TOKEN here. `id-token: write` stays,
+# because both provenance and trusted publishing use the OIDC token.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify before publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install dependencies (npm ci)
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Test
+        run: npm test
+
+      - name: Syntax check every src/*.js
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(packages/*/src/*.js)
+          if ((${#files[@]} == 0)); then
+            echo "::error::No packages/*/src/*.js files found"
+            exit 1
+          fi
+          for file in "${files[@]}"; do
+            node --check "$file"
+          done
+          echo "node --check: ${#files[@]} file(s) OK"
+
+      - name: Pack manifest smoke test
+        run: node scripts/smoke-pack.mjs
+
+      - name: Verify tag commit is on main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor HEAD FETCH_HEAD; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not point at a commit on main"
+            exit 1
+          fi
+
+  publish:
+    name: Publish with provenance
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Check tag matches every package version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          expected="${RELEASE_TAG#v}"
+          for manifest in packages/*/package.json; do
+            name="$(node -p "require('./${manifest}').name")"
+            version="$(node -p "require('./${manifest}').version")"
+            if [ "$version" != "$expected" ]; then
+              echo "::error::${name}@${version} does not match tag ${RELEASE_TAG} (expected ${expected})"
+              exit 1
+            fi
+          done
+          echo "tag ${RELEASE_TAG} matches all workspace versions"
+
+      # Without this preflight, a re-run of an old tag would publish some
+      # packages and then fail on the first already-published version.
+      - name: Check versions are not already on npm
+        shell: bash
+        run: |
+          set -euo pipefail
+          for manifest in packages/*/package.json; do
+            name="$(node -p "require('./${manifest}').name")"
+            version="$(node -p "require('./${manifest}').version")"
+            if npm view "${name}@${version}" version >/dev/null 2>&1; then
+              echo "::error::${name}@${version} is already on npm; bump the version before tagging"
+              exit 1
+            fi
+          done
+          echo "all workspace versions are unpublished"
+
+      - name: Publish workspaces with provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "::error::secrets.NPM_TOKEN is empty; configure the npm publish token first"
+            exit 1
+          fi
+          npm publish --workspaces --access public --provenance

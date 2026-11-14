@@ -1,0 +1,103 @@
+name: Bug report
+description: Report a reproducible bug in a dsh-os-suite package.
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not report security vulnerabilities here.** Follow [SECURITY.md](https://github.com/PerryLink/dsh-os-suite/blob/main/SECURITY.md) and use GitHub Security Advisories.
+
+        Please search existing issues first and include a minimal reproduction. Remove tokens, keys, customer data, and other secrets from logs.
+
+  - type: dropdown
+    id: package
+    attributes:
+      label: Affected package
+      description: Which package is affected?
+      multiple: false
+      options:
+        - dsh-os-trace
+        - dsh-os-lease
+        - dsh-os-quota
+        - dsh-os-eval
+        - dsh-os-catalog
+        - dsh-os-registry
+        - Suite / repository (not package-specific)
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Package version
+      description: The version reported by the package, or the commit you tested.
+      placeholder: "0.1.1"
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Node.js version, and DSH version.
+      placeholder: "Windows 11, Node 24.22.1, DSH 0.2.2-rc.3"
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the actual behavior, including the tool result or error.
+      placeholder: "quota_status returned ..., the plugin failed to load with ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+      description: Describe the behavior you expected and why.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: A minimal, deterministic sequence. Include config and data shapes if relevant.
+      placeholder: |
+        1. Create an isolated DSH_HOME
+        2. Install dsh-os-trace@0.1.1
+        3. Call trace_verify with ...
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or output
+      description: Paste only the relevant lines. Redact secrets and personal data.
+      render: shell
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Anything else that helps triage, such as a workaround or a related issue.
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and did not find a duplicate.
+          required: true
+        - label: This is a bug report, not a security vulnerability.
+          required: true
+        - label: I removed tokens, keys, customer data, and other secrets from this report.
+          required: true
+        - label: I am using the latest 0.1.x release (or stated the version above).
+          required: false
