@@ -1,0 +1,4 @@
+node_modules/
+*.tgz
+.DSH_HOME/
+*.log

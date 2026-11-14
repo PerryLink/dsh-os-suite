@@ -1,0 +1,64 @@
+{
+  "name": "dsh-os-trace",
+  "version": "0.1.0",
+  "description": "Causal audit and tamper-evident evidence bundles for DSH agent runs.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "README.md",
+    "DESIGN.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.9.0",
+    "dsh": ">=0.2.2-rc.3 <0.3.0"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "author": "PerryLink",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PerryLink/dsh-os-suite.git",
+    "directory": "packages/dsh-os-trace"
+  },
+  "homepage": "https://github.com/PerryLink/dsh-os-suite/tree/main/packages/dsh-os-trace#readme",
+  "bugs": {
+    "url": "https://github.com/PerryLink/dsh-os-suite/issues"
+  },
+  "keywords": [
+    "deepseek",
+    "dsh",
+    "dsh-plugin",
+    "agent",
+    "audit",
+    "observability",
+    "evidence",
+    "trace"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.1.0",
+    "@deepseek-ai/dsh-tools": ">=0.2.2-rc.3 <0.3.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.1.0",
+    "@deepseek-ai/dsh-tools": "0.2.2-rc.3"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "private": false,
+  "sideEffects": false
+}

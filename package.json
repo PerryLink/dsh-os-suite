@@ -1,0 +1,15 @@
+{
+  "name": "dsh-os-suite",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "test": "node --test packages/dsh-os-*/test/*.test.js"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.1.0",
+    "@deepseek-ai/dsh-tools": "0.2.2-rc.3"
+  }
+}
