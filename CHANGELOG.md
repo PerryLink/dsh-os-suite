@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.2] - 2026-11-14
+
+### Changed
+- First release published by the GitHub Actions `release.yml` workflow with npm provenance.
+- No functional changes; version alignment only.
+
 All notable changes to `dsh-os-suite` are documented here.
 
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The six packages are versioned and released in lockstep.

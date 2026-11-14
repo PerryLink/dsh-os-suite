@@ -1,6 +1,6 @@
 {
   "name": "dsh-os-lease",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Workspace lease intents and multi-file transaction plans for parallel DSH agents.",
   "type": "module",
   "license": "Apache-2.0",
