@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.2.4] - 2026-11-15
+
+### Fixed
+- README: correct DSH host version references back to `0.2.2-rc.3` (0.2.3 accidentally rewrote them to a non-existent `0.2.3-rc.3`).
+
 ## [0.2.3] - 2026-11-15
 
 ### Fixed

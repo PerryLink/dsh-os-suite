@@ -1,6 +1,6 @@
 {
   "name": "dsh-os-trace",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Causal audit and tamper-evident evidence bundles for DSH agent runs.",
   "type": "module",
   "license": "Apache-2.0",

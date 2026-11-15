@@ -7,7 +7,7 @@
 >
 > Local service and port registry for dev servers started by DSH agents.
 
-**状态：0.2.3（MVP，已发布到 npm）。** 社区项目，非 DeepSeek 官方项目，Apache-2.0，无 SLA。
+**状态：0.2.4（MVP，已发布到 npm）。** 社区项目，非 DeepSeek 官方项目，Apache-2.0，无 SLA。
 
 ## 为什么
 
@@ -20,7 +20,7 @@
 
 ## 安装
 
-要求 Node.js 24+、DSH `>=0.2.3-rc.3 <0.3.0`。包是纯 ESM JavaScript + JSDoc，无构建步骤。
+要求 Node.js 24+、DSH `>=0.2.2-rc.3 <0.3.0`。包是纯 ESM JavaScript + JSDoc，无构建步骤。
 
 npm 发布后：
 

@@ -37,7 +37,7 @@ when agents must share one workspace safely.
 
 ## Install
 
-The package is **published as `dsh-os-lease@0.2.3`**. From npm:
+The package is **published as `dsh-os-lease@0.2.4`**. From npm:
 
 ```sh
 npm install
@@ -50,7 +50,7 @@ Once published, it is a standard DSH bundle:
 dsh plugin add dsh-os-lease
 ```
 
-Requirements: DSH `>=0.2.3-rc.3 <0.3.0`, Node `^22.19.0 || >=24.9.0` (pure ESM
+Requirements: DSH `>=0.2.2-rc.3 <0.3.0`, Node `^22.19.0 || >=24.9.0` (pure ESM
 JavaScript, JSDoc types, no build step).
 
 ## Tools

@@ -1,6 +1,6 @@
 {
   "name": "dsh-os-quota",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Token, job and disk budgets with admission decisions and opt-in pre-execute enforcement for DSH agents.",
   "type": "module",
   "license": "Apache-2.0",
