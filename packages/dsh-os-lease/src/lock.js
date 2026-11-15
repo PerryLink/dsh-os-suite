@@ -589,6 +589,14 @@ export async function allocateFence(fencePath) {
         await sleep(FENCE_RETRY_DELAY_MS)
         continue
       }
+      // Windows can return EPERM/EACCES/EEXIST when another allocator still
+      // holds the destination open. Drop the candidate and retry; the counter
+      // re-read keeps duplicate tokens impossible.
+      if (error instanceof Error && ['EPERM', 'EACCES', 'EEXIST'].includes(error.code)) {
+        await fs.unlink(candidate).catch(() => {})
+        await sleep(FENCE_RETRY_DELAY_MS)
+        continue
+      }
       await fs.unlink(candidate).catch(() => {})
       throw new LockError(
         LOCK_ERROR_CODES.FENCE_FAILED,
