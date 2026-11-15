@@ -8,7 +8,7 @@
 Six small, composable **governance-layer** plugins for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH).
 
 > **Community project. Not affiliated with, sponsored by, or endorsed by DeepSeek.**
-> Apache-2.0. No SLA, no warranty. Early MVP, published as `0.2.2` on npm (2026-11-15).
+> Apache-2.0. No SLA, no warranty. Early MVP, published as `0.2.3` on npm (2026-11-15).
 
 DSH already has the organs of an agent OS — sessions, tools, agent loop, sandbox, approvals, jobs, teams, worktrees, MCP. What it lacks is the **nervous system**: who is running, what they consume, why something happened, how to resume after a crash, what can do X, and whether a change made things worse. These six packages target that layer, not another UI skin or file search.
 
@@ -30,7 +30,7 @@ DSH already has the organs of an agent OS — sessions, tools, agent loop, sandb
 - **Names verified**: `npm view <name>` → E404; GitHub exact-name search → 0 (2026-11-15). See [NAME-CHECK.md](NAME-CHECK.md).
 - **Pre-release audit**: [AUDIT.md](AUDIT.md); three findings fixed (Apache-2.0 LICENSE, description accuracy, read-only `quota_status`).
 - **Real install verified** in an isolated `DSH_HOME`: all six tarballs install via `dsh plugin --profile web add`, and `--dump-config` lists all six entries.
-- **Published**: all six packages at `0.2.2` on npm (2026-11-15).
+- **Published**: all six packages at `0.2.3` on npm (2026-11-15).
 
 ## Install
 

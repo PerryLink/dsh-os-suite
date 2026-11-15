@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.2.3] - 2026-11-15
+
+### Fixed
+- `dsh-os-lease`: retry fence publication on Windows `EPERM`/`EACCES`/`EEXIST` instead of failing the acquire.
+
 ## [0.2.2] - 2026-11-15
 
 ### Added

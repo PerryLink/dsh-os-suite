@@ -36,7 +36,7 @@ dsh plugin --profile dev add ./packages/dsh-os-catalog
 dsh --profile dev --dump-config   # 应能看到 dsh-os-catalog 层
 ```
 
-要求：Node 24（无构建步骤，纯 ESM + JSDoc），DSH `>=0.2.2-rc.3 <0.3.0`。
+要求：Node 24（无构建步骤，纯 ESM + JSDoc），DSH `>=0.2.3-rc.3 <0.3.0`。
 
 安装后有两种方式填充目录：
 

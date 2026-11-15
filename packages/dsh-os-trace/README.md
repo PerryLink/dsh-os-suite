@@ -7,7 +7,7 @@
 >
 > Causal audit and tamper-evident evidence bundles for DSH agent runs.
 
-**状态：源码在 0.2.2 基础上加入实时事件采集、HMAC 签名、OTLP/JSON 导入导出与 W3C `traceparent` 字符串互操作（尚未发布到 npm；npm 上的 0.2.2 不含这些能力）。** 社区项目，非 DeepSeek 官方项目，Apache-2.0，无 SLA。
+**状态：源码在 0.2.3 基础上加入实时事件采集、HMAC 签名、OTLP/JSON 导入导出与 W3C `traceparent` 字符串互操作（尚未发布到 npm；npm 上的 0.2.3 不含这些能力）。** 社区项目，非 DeepSeek 官方项目，Apache-2.0，无 SLA。
 
 ## 为什么
 
@@ -22,7 +22,7 @@ DSH 的 session 日志能回答「发生过什么」，但很难直接回答下�
 
 ## 安装
 
-要求 Node.js 24+、DSH `>=0.2.2-rc.3 <0.3.0`。纯 ESM JavaScript + JSDoc，无构建步骤。
+要求 Node.js 24+、DSH `>=0.2.3-rc.3 <0.3.0`。纯 ESM JavaScript + JSDoc，无构建步骤。
 
 npm 发布后：
 

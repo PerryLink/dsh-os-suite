@@ -6,7 +6,7 @@
 
 `dsh-os-quota` adds the missing "resource governor" primitive to a DeepSeek Harness (DSH) deployment: one small ledger per scope (session, agent, team, sandbox — your choice of id), three budgets, and a policy answer to *"may this work start?"* — not just a meter that tells you later what it cost.
 
-- Status: **0.2.2 MVP, published to npm** (name verified free on 2026-11-14).
+- Status: **0.2.3 MVP, published to npm** (name verified free on 2026-11-14).
 - Runtime: pure ESM JavaScript, Node 24+, no build step, no `@deepseek-ai/*` imports in `src/core.js`, `src/enforce.js`, `src/meter.js` or `src/pressure.js`.
 - Tests: `node --test` (73 tests, offline, injectable clock, fake event bus, fake token-meter/jobs services).
 
@@ -50,7 +50,7 @@ Or pack it first:
 ```sh
 cd packages/dsh-os-quota
 npm pack
-dsh plugin --profile quota add ./dsh-os-quota-0.2.2.tgz
+dsh plugin --profile quota add ./dsh-os-quota-0.2.3.tgz
 ```
 
 Once published, the same flow is:
@@ -59,7 +59,7 @@ Once published, the same flow is:
 dsh plugin --profile quota add dsh-os-quota
 ```
 
-`package.json` declares `dsh.bundle.patch` and `engines.dsh` (`>=0.2.2-rc.3 <0.3.0`); check the range before installing into a different DSH release. The bundle patch inserts one plugin row (`dsh-os-quota`).
+`package.json` declares `dsh.bundle.patch` and `engines.dsh` (`>=0.2.3-rc.3 <0.3.0`); check the range before installing into a different DSH release. The bundle patch inserts one plugin row (`dsh-os-quota`).
 
 ## Tools
 

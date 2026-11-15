@@ -2,7 +2,7 @@
 
 > Regression eval gates for DSH agents: case definitions, baseline comparison and CI verdicts.
 
-**0.2.2 · pure ESM + JSDoc · Node 24+ · Apache-2.0**
+**0.2.3 · pure ESM + JSDoc · Node 24+ · Apache-2.0**
 
 A community project. Not affiliated with DeepSeek. No SLA, no warranty.
 
@@ -52,8 +52,8 @@ Once published, the normal install path will be:
 npm install dsh-os-eval
 ```
 
-The package requires a DSH version matching `>=0.2.2-rc.3 <0.3.0` and
-`@deepseek-ai/dsh-tools` `0.2.2-rc.3`.
+The package requires a DSH version matching `>=0.2.3-rc.3 <0.3.0` and
+`@deepseek-ai/dsh-tools` `0.2.3-rc.3`.
 
 ### Configure a suite
 
@@ -420,7 +420,7 @@ than crashing the gate.
   `apply(ctx, { runner })`, that code can do anything the host can do. Audit it
   like any other plugin, and never put secrets in cases, mocks, or recordings.
 
-## Limitations (0.2.2)
+## Limitations (0.2.3)
 
 - **Exact reads by default; live watching is opt-in.** Exported plain-text
   JSONL (`sessionFile`) and `ctx.sessionQuery.readSession(sessionId)`
