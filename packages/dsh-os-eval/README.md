@@ -2,7 +2,7 @@
 
 > Regression eval gates for DSH agents: case definitions, baseline comparison and CI verdicts.
 
-**0.1.0 MVP · pure ESM + JSDoc · Node 24+ · Apache-2.0**
+**0.2.0 · pure ESM + JSDoc · Node 24+ · Apache-2.0**
 
 A community project. Not affiliated with DeepSeek. No SLA, no warranty.
 
@@ -17,8 +17,9 @@ renamed tool can break an instruction without anyone noticing.
 
 - **Cases are data.** A case has an id, input, expectations, and tags. No test
   framework required.
-- **Runs are replayable.** A runner is injected. In the MVP it is a mock; a host
-  can plug in a recorded-trajectory adapter without changing the gate.
+- **Runs are replayable.** A recorded session can be read from one exported
+  JSONL file, paired into a tool trajectory, and graded deterministically. A
+  host runner and a mock remain available when no recording is supplied.
 - **Baselines are explicit.** Compare token usage with a stored p50 and turn a
   >20% regression into a WARN instead of a surprise bill.
 - **CI gets one verdict.** `PASS`, `WARN`, or `FAIL`, with reasons and the
@@ -74,8 +75,22 @@ bundle inserted, use a loader patch that targets its id:
         p50Tokens: 120
 ```
 
-Without preloaded cases, pass an inline `case` to `eval_run`. Without an
-injected host runner, pass a `mock` result; there is no implicit model call.
+Without preloaded cases, pass an inline `case` to `eval_run`.
+
+To grade a recording, export one session as **plain-text JSONL** (the Web UI's
+**Export session** action or the host's `/api/session.export` route) and pass
+its path as `sessionFile`:
+
+```json
+{
+  "caseId": "recorded-greeting",
+  "sessionFile": "/tmp/dsh-evals/recorded-greeting.jsonl"
+}
+```
+
+The recording wins over an injected host runner and over `mock`; the fallback
+chain is **sessionFile → host runner → mock**. There is no implicit model call
+in any branch. Without a recording or an injected runner, pass a `mock` result.
 
 ## Tools
 
@@ -91,11 +106,20 @@ run.
 |---|---|---|
 | `caseId` | string (required) | Id of a configured case, or of the inline `case`. |
 | `case` | object | Optional inline `{ id, name, input, expect, tags? }`. Duplicate ids are rejected. |
-| `mock` | object | Mock runner result: `{ output?, steps?, tokens?, latencyMs? }`. Ignored when the host injected a runner. |
+| `sessionFile` | string | Path to one exported, uncompressed session `.jsonl` file. Highest precedence. |
+| `mock` | object | Mock runner result: `{ output?, steps?, tokens?, latencyMs? }`. Used only when neither `sessionFile` nor a host runner is present. |
 | `baseline` | object | Optional `{ passRate, p50Tokens }` to store and compare with this run. |
 
-Returns `{ run, comparison }`. `run` is
-`{ caseId, output, steps, tokens, latencyMs, status, reasons }`.
+Returns `{ run, comparison, trajectory }`. `run` is
+`{ caseId, output, steps, tokens, latencyMs, status, reasons }`. `trajectory`
+is `null` for a mock/host run; for a recording it is a compact summary
+(`sessionId`, `turns`, `messages`, `steps`, `tokens`, `latencyMs`, `paired`,
+`toolErrors`, `tools`) with no tool arguments or raw results.
+
+For a recorded session, `output` is the final non-empty assistant message,
+`steps` is the number of paired tool calls, and `tokens` is the summed
+assistant-message usage. A runner exception or a missing expectation is still
+recorded as a `FAIL` run.
 
 The standalone mock echoes `input` as text and reports 0 steps/tokens unless the
 mock overrides them. It exists to test the gate, not to evaluate a model.
@@ -136,9 +160,63 @@ Verdict rules:
 
 Returns aggregate counts (`total`, `runCount`, `passed`, `failed`, `notRun`,
 `passRate`, `tokens`, `steps`) plus one summary row per case. It never includes
-raw runner output, only status, metrics, and failure reasons.
+raw runner output, only status, metrics, failure reasons, and — when the case
+was last run from a recording — a `trajectory` summary.
 
-Optional `tags` uses the same AND filter as `eval_gate`.
+The top-level `trajectory` object aggregates the selected recorded cases:
+
+```json
+{
+  "sessions": 1,
+  "turns": 2,
+  "messages": 2,
+  "steps": 1,
+  "tokens": 27,
+  "latencyMs": 7,
+  "toolErrors": 0,
+  "tools": { "read": 1 }
+}
+```
+
+Per-case `trajectory` is `null` for a mock/host run, and a later non-session run
+clears the stale summary. Optional `tags` uses the same AND filter as
+`eval_gate`.
+
+## Recorded-session API
+
+The same read-only replay logic is available outside the tools through the
+`dsh-os-eval/session` subpath:
+
+```js
+import {
+  evaluate,
+  parseSessionJsonl,
+  readSessionFile,
+  replay,
+  trajectoryOf,
+} from 'dsh-os-eval/session'
+
+const session = readSessionFile('/tmp/dsh-evals/recorded-greeting.jsonl')
+const trajectory = trajectoryOf(session)     // paired { tool, args, result } steps
+
+const replayed = replay(session, {
+  runner: ({ tool, args, result }) => ({ tool, ok: result !== null }),
+})
+// replayed.results === one runner return value per tool step
+
+const grades = evaluate(session, [{
+  id: 'recorded-greeting',
+  name: 'Recorded greeting',
+  expect: { contains: ['hello'], maxSteps: 3, maxTokens: 200 },
+}])
+// grades.cases === one { caseId, status, reasons, ... } row per case
+```
+
+`parseSessionJsonl(text)` accepts `type` or `kind` tags, nested `data` or flat
+payloads, the `tool/call` / `tool/result` / `assistant/message` / `turn/*` and
+`step/*` events, and ignores malformed lines and unknown event types/fields.
+`trajectoryOf` pairs calls and results by `callId`, including results that
+arrive before their call; unanswered calls remain with `hasResult: false`.
 
 ## Scoring
 
@@ -151,29 +229,45 @@ Every check in `expect` must hold; a single failure makes the run `FAIL`.
 | `maxSteps: number` | `steps <= maxSteps`. |
 | `maxTokens: number` | `tokens <= maxTokens`. |
 
+For a recorded session, `output` is the final non-empty assistant text (reasoning
+and tool-call blocks excluded), `steps` counts paired tool calls, and `tokens`
+sums `totalTokens` when present, otherwise input + output + cache-read +
+cache-write tokens. Tool arguments and result texts are available to `replay`
+callbacks but are not graded by `expect`.
+
 A runner exception is recorded as a `FAIL` run with the error message, rather
 than crashing the gate.
 
 ## Permissions and data
 
-- **No model, network, filesystem, or shell access.** The core is pure logic;
-  the plugin only registers tools.
-- **No raw trajectories are stored.** The store keeps the latest run per case:
-  caseId, output, steps, tokens, latency, status, reasons. It does not keep
-  prompts, messages, tool-call transcripts, or history.
-- **Reports contain summaries only.** `eval_report` omits `output`.
+- **No model, network, or shell access.** The core is pure logic. One sync
+  filesystem read happens only when a caller explicitly supplies `sessionFile`.
+- **Visible-tool-run data.** The store keeps the latest run per case: caseId,
+  output, steps, tokens, latency, status, reasons, plus a compact trajectory
+  summary (session id, counts, tool names, error count). It does not keep
+  prompts, user/system messages, complete tool transcripts, or history.
+- **Reports contain summaries only.** `eval_report` omits `output`, tool
+  arguments, and raw tool results. The programmatic `replay`/`evaluate` APIs
+  return step details to their caller; nothing is persisted by this package.
 - **Memory only.** Data lives for the lifetime of the plugin instance and is
   gone after a restart. Baselines are loaded from config, not from a database.
+- **Explicit file only.** `sessionFile` reads exactly the one path given by the
+  caller: no session-root discovery, no directory listing, no subagent archive
+  traversal. Treat exported logs as trusted fixtures.
 - **Injected runners run with host permissions.** If a host supplies
   `apply(ctx, { runner })`, that code can do anything the host can do. Audit it
-  like any other plugin, and never put secrets in cases or mocks.
+  like any other plugin, and never put secrets in cases, mocks, or recordings.
 
-## Limitations (MVP)
+## Limitations (0.2.0)
 
-- **No real session/runner adapter.** The standalone runner is a mock. A host
-  can inject a synchronous `runner`, but this package does not read DSH
-  sessions, replay live model calls, or attach to session-query/OTel yet. See
-  [DESIGN.md](DESIGN.md) for the planned adapters.
+- **Reads exported plain-text JSONL only.** There is no OTel exporter, no
+  session-query integration, and no live-session or session-database read.
+  Zstandard-compressed logs (`.jsonl.zstd`), session directories, and exported
+  ZIP archives are not supported; use the host's Export session action and
+  pass the resulting uncompressed `.jsonl` file.
+- **Recorded output replay, not live model replay.** `replay` invokes only the
+  local synchronous callback it is given. The package never calls a model,
+  re-runs a prompt, or compares against a fresh live run.
 - **Synchronous runners only.** Returning a Promise raises
   `ASYNC_RUNNER_UNSUPPORTED`.
 - **One latest run per case.** No repeated runs, flake detection, confidence
@@ -182,10 +276,10 @@ than crashing the gate.
   unrun selected cases are reported as `NOT_RUN` but are not counted in the
   failure ratio. Gate all cases only after running all of them.
 - **Baseline pass rate is informational.** `compareToBaseline` reports
-  `passRateDelta`, but the 0.1 gate only warns on token regression.
+  `passRateDelta`, but the current gate only warns on token regression.
 - **No persistence, parallelism, dashboard, or UI.**
-- **Trusted fixtures.** Cases are not a sandbox; do not feed untrusted prompts
-  or secrets into a shared suite.
+- **Trusted fixtures.** Cases and recordings are not a sandbox; do not feed
+  untrusted prompts or secrets into a shared suite.
 
 ## Naming check (2026-11-14)
 

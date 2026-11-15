@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.0] - 2026-11-15
+
+### Added
+- `dsh-os-trace`: live event ingestion (`session/tools/approval/agent/subagent/job/mcp`) and optional HMAC-signed evidence bundles.
+- `dsh-os-quota`: `tools/pre-execute` enforcement (hard deny / soft degrade), usage consumption.
+- `dsh-os-lease`: optional real file applier with temp+fsync+rename, journal and rollback.
+- `dsh-os-eval`: session JSONL parsing, trajectory pairing and replay/evaluate.
+- CI: real `DSH_HOME` install smoke, Windows/macOS matrix, coverage artifact.
+
 ## [0.1.2] - 2026-11-14
 
 ### Changed

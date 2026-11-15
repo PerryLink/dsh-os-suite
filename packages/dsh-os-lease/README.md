@@ -8,8 +8,10 @@
 `dsh-os-lease` lets several agents work in one workspace without silently
 overwriting each other. An agent reserves workspace-relative paths with a
 time-to-live lease, stages intended file bodies as a patchset, and commits or
-rolls back the patchset as one logical unit. Everything is recorded as intent;
-the MVP never reads or writes files.
+rolls back the patchset as one logical unit. The default is **dry-run**: commit
+returns a write plan and touches nothing. Opt in with `apply: true` plus an
+explicit `root`, and commit writes each file atomically and keeps a recoverable
+journal for rollback.
 
 ## Why: worktrees isolate, they do not coordinate
 
@@ -35,7 +37,7 @@ when agents must share one workspace safely.
 
 ## Install
 
-The package is **published as `dsh-os-lease@0.1.2`**. From npm:
+The package is **published as `dsh-os-lease@0.2.0`**. From npm:
 
 ```sh
 npm install
@@ -48,14 +50,32 @@ Once published, it is a standard DSH bundle:
 dsh plugin add dsh-os-lease
 ```
 
-Requirements: DSH `>=0.2.2-rc.3 <0.3.0`, Node 24 (pure ESM JavaScript, JSDoc
-types, no build step).
+Requirements: DSH `>=0.2.2-rc.3 <0.3.0`, Node `^22.19.0 || >=24.9.0` (pure ESM
+JavaScript, JSDoc types, no build step).
 
 ## Tools
 
-The plugin registers four tools. All four are thin wrappers over
-`src/core.js`; the core has no `@deepseek-ai/*` imports and is unit-testable
-offline.
+The plugin registers four tools. Lease and plan logic lives in `src/core.js`
+(no `@deepseek-ai/*` imports); the opt-in filesystem executor lives in
+`src/apply.js`. Both are unit-testable offline.
+
+### Enabling real writes
+
+Without configuration the plugin is dry-run only. Real writes require **both**
+keys in the plugin config:
+
+```yaml
+dsh-os-lease:
+  apply: true
+  root: /srv/shared-workspace
+```
+
+`root` is canonicalized with `realpath` when the first write happens. Every
+patchset path must stay inside that directory; absolute paths, drive-letter
+paths, `..`, and symbolic links are refused. `verifyBefore: true` is an optional
+extra guard that rejects an apply when a caller-supplied `before` body does not
+match the file on disk. Leave `apply` absent or `false` to keep the safe
+plan-only behavior even if `root` is set.
 
 ### `workspace_lease`
 
@@ -82,25 +102,54 @@ Two-phase patchset handling. `action: "prepare"` needs `leaseId` and `files:
 - `prepare` validates that the lease is alive, every path is covered by the
   lease, paths are unique and workspace-relative, and no other prepared
   patchset overlaps them. It records the before/after bodies and returns the
-  patchset.
+  patchset. No file is touched.
 - `commit` requires the lease to still be active and transitions the patchset
   to `committed`. It returns the **path-sorted write set**
   `[{ path, after }]`. A second commit is an error, not a no-op.
+- With `apply: true` and `root`, commit also executes the write set: each file
+  is written to a sibling temp file, fsynced, then renamed over the target. The
+  real on-disk pre-image is saved to
+  `.dsh-os-lease/journal/<patchsetId>/backups/`, and the returned `journal`
+  describes every path. A failed apply attempts to restore the files it already
+  journaled before reporting the error.
 
 ### `workspace_rollback`
 
 Takes `patchsetId`, transitions a `prepared` or `committed` patchset to
 `rolledBack`, and returns the path-sorted pre-images
 `[{ path, before? }]`. A file staged without `before` comes back without a
-`before` key, meaning "new file". Rolling back twice is an error. Rollback is
-allowed even after the lease expired or was released, so cleanup is never
-blocked by a stale lease.
+`before` key, meaning "new file".
+
+When `root` is configured and `.dsh-os-lease/journal/<patchsetId>/` exists,
+rollback first restores the journal **in reverse apply order**: existing files
+are written back from their backups (temp file + fsync + rename), newly added
+files are deleted, and directories created by the apply are removed when empty.
+The journal is then marked `rolledBack`. The same `rollback()` call is
+idempotent and a second call is a no-op; the tool-level patchset transition
+still reports a double rollback as an error. Rollback is allowed even after the
+lease expired or was released, so cleanup is never blocked by a stale lease.
 
 ### `workspace_status`
 
 Takes no parameters. Returns `{ now, defaultTtlMs, leases, patchsets, counts
 }`. Patchsets are summarized by path and status; file bodies are not echoed.
 The same snapshot is available from `manager.status()`.
+
+### Journal API (embedding)
+
+`src/apply.js` (published as the `dsh-os-lease/apply` subpath) exports the
+executor for hosts that want the same behavior without the tool layer:
+
+- `applyPatchset(patchset, { root, verifyBefore? })` → journal
+- `readJournal(id, { root })` → parsed journal manifest
+- `rollback(journalPathOrJournal, { root? })` → rollback summary
+
+The journal lives at
+`<root>/.dsh-os-lease/journal/<id>/journal.json`; pre-images live in
+`<root>/.dsh-os-lease/journal/<id>/backups/`. The manifest records paths,
+existence, modes, sizes, and SHA-256 hashes, but not file bodies. Failures throw
+`ApplyError` with a stable `code` such as `INVALID_PATH`, `PATH_ESCAPE`,
+`LOCKED`, `ALREADY_APPLIED`, `BACKUP_MISSING`, or `ROLLBACK_FAILED`.
 
 Typical flow:
 
@@ -114,41 +163,76 @@ Typical flow:
   { "path": "src/api/schema.js", "after": "..." }
 ] }
 
-// 3. Commit: returns writes sorted by path
+// 3. Commit: dry-run returns writes sorted by path; with apply:true + root it
+//    also writes atomically and returns { applied: true, journal }
 { "action": "commit", "patchsetId": "patchset-1" }
+
+// 4. Optional cleanup (after a real apply)
+{ "action": "rollback", "patchsetId": "patchset-1" }
 ```
 
 ## Permissions and data
 
-- **Intent only.** The package does not read, write, create, delete, or stat any
-  file. It does not spawn processes, use the network, or read environment
-  variables.
-- `before` / `after` bodies are caller-supplied and held in memory for the life
-  of the manager. `workspace_status` intentionally omits them.
-- Lease and patchset ids, paths, owner labels, TTLs, and timestamps live in
-  memory only. A plugin restart loses all leases and patchsets.
-- No credentials, no telemetry, no external storage, no privileges beyond the
-  DSH tool call itself.
+- **Dry-run by default.** The package performs no filesystem access unless the
+  plugin is configured with `apply: true` and `root`. It never spawns
+  processes, uses the network, or reads environment variables.
+- **With `apply: true`.** The executor reads and writes only under the
+  canonical `root`, refuses symbolic links on the target chain, and stores its
+  own state under `<root>/.dsh-os-lease/`. Treat that directory as sensitive:
+  backups contain pre-images of edited files. Add `.dsh-os-lease/` to the target
+  repository's ignore file if the workspace is a git checkout.
+- The manifest stores paths, modes, sizes, and hashes; file bodies are written
+  only to the backup files. `workspace_status` continues to echo no bodies.
+- Leases and patchsets live in memory. A plugin restart loses them; journals and
+  locks on disk survive and can be rolled back or inspected by the next process
+  with the same `root`.
+- No credentials, no telemetry, no external storage. The applier has no
+  privileges beyond the DSH process that runs it.
 
-## Limitations (MVP)
+## Limitations
 
-- **Does not write files.** `commit` returns a write plan; your host/applier must
-  perform it. There is no atomic file replacement, fsync, or backup.
-- **In-process only.** There is no cross-process or cross-host lock. Two DSH
-  processes (or two plugin instances) do not see each other's leases.
-- **No persistence.** Restarting DSH drops all state; expired workspaces are
-  reclaimed only as a new process sees them.
-- **Caller-provided pre-images are trusted.** The core cannot verify that a
-  `before` value matches the file on disk. An applier must compare before
-  writing.
+- **Default is plan-only.** Commit writes nothing unless the plugin config has
+  both `apply: true` and `root`. There is no per-call override.
+- **No cross-host lock.** Overlapping applies are excluded with local
+  `fs.open('wx')` lock files under `<root>/.dsh-os-lease/locks/`. This
+  coordinates cooperating processes on the **same host and filesystem**; it is
+  not a distributed lock. A crashed process can leave a stale lock file, which
+  must be removed manually after confirming no apply is still running.
+- **Per-file atomic, not multi-file crash-atomic.** Each file is temp-file +
+  fsync + rename, but a crash between files leaves a partially applied tree.
+  The journal is marked `applying`; run `rollback(journal)` to restore it.
+  Recovery is best effort, not a transactional filesystem.
+- **Caller-provided pre-images are advisory by default.** The applier always
+  backs up the real on-disk pre-image, but it compares a supplied `before` only
+  when `verifyBefore: true`.
+- **Symbolic links are refused.** A link anywhere on the target chain is
+  rejected even if it resolves inside `root`, because rename would replace the
+  link rather than its target. Path checks are not atomic against a hostile
+  process mutating directories concurrently (TOCTOU); use an OS sandbox for
+  adversarial workloads.
+- **In-process leases.** There is no cross-process or cross-host lease view.
+  Two DSH processes do not see each other's leases; the applier locks only
+  protect file application.
+- **No persistence of leases.** Restarting DSH drops all lease and patchset
+  state; expired workspaces are reclaimed only as a new process sees them.
 - **Case-sensitive.** Paths differing only by case are distinct. On
   case-insensitive filesystems, two such leases can both exist.
 - **No globs, symlink resolution, rename, or deletion semantics.** Paths are
   literal workspace-relative strings; `..` and absolute paths are rejected.
+  Deletion exists only as rollback of files that the journal created.
 - **TTL is clock-based.** The default clock is `Date.now()`; callers may inject
   a clock for tests. There is no heartbeat/dead-agent detector.
 - **No merge or nested transactions.** A prepared patchset must be committed or
   rolled back before another patchset may touch overlapping paths.
+- **Rollback assumes journaled paths are not edited externally.** It restores
+  every journaled entry (existing files from backup, new files deleted), which is
+  what makes a crash-partial apply recoverable. Locks coordinate applies, not
+  external editors or a human changing files while a rollback runs. Rollback
+  itself does not take the per-path locks: do not run it concurrently with an
+  apply on the same paths.
+- **Journals accumulate.** Rollback does not delete the journal directory, so
+  `readJournal`/`rollback` remain idempotent. Remove a `rolledBack` journal
+  manually if you want to reclaim space.
 
 ## Naming verification
 
@@ -168,10 +252,13 @@ repository names can be claimed at any time.
 node --test packages/dsh-os-lease/test/*.test.js
 ```
 
-11 tests cover acquire/release, TTL expiry, prefix conflicts, workspace
-isolation, prepare/commit sorting, rollback and duplicate transitions, lease
-lifetime at commit, path validation, prepared-patchset overlap, and status
-counts.
+30 tests cover leases (acquire/release, TTL expiry, prefix conflicts, workspace
+isolation, lease lifetime at commit), patchset planning (prepare/commit
+sorting, duplicate transitions, prepared-patchset overlap, status counts), and
+the applier (write/read journals, atomic mode-preserving replacement, path and
+symlink escape rejection, rollback restore/delete, idempotent rollback, missing
+backup errors, duplicate journal ids, per-path locks, a concurrent lock race,
+`verifyBefore`, and the dry-run/apply/rollback tool wiring).
 
 ## License
 

@@ -123,6 +123,7 @@ export class LeaseError extends Error {
  * @property {() => { now: number, defaultTtlMs: number, leases: Lease[], patchsets: PatchsetSummary[], counts: Record<string, Record<string, number>> }} status
  * @property {(input: { workspace: string, paths: string[] }) => CheckConflictResult} checkConflict
  * @property {(leaseId: string, files: Array<{ path: string, before?: string, after: string }>) => Patchset} preparePatchset
+ * @property {(id: string) => Patchset} getPatchset
  * @property {(id: string) => Array<{ path: string, after: string }>} commitPatchset
  * @property {(id: string) => Array<{ path: string, before?: string }>} rollbackPatchset
  */
@@ -756,6 +757,17 @@ export function createLeaseManager(options = {}) {
   }
 
   /**
+   * Return a snapshot of a patchset, including its recorded before/after
+   * bodies. This is a read-only accessor for appliers; it never changes state.
+   *
+   * @param {string} id
+   * @returns {Patchset}
+   */
+  function getPatchset(id) {
+    return snapshotPatchset(requirePatchset(id))
+  }
+
+  /**
    * Commit a prepared patchset and return its write set sorted by path.
    * A commit is a one-way transition: repeated commits throw
    * ALREADY_COMMITTED, and a commit requires the authorizing lease to still be
@@ -868,6 +880,7 @@ export function createLeaseManager(options = {}) {
     status,
     checkConflict,
     preparePatchset,
+    getPatchset,
     commitPatchset,
     rollbackPatchset,
   }

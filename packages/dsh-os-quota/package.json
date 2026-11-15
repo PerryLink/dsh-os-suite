@@ -1,7 +1,7 @@
 {
   "name": "dsh-os-quota",
-  "version": "0.1.2",
-  "description": "Advisory token, job and disk budgets with admission decisions for DSH agents.",
+  "version": "0.2.0",
+  "description": "Token, job and disk budgets with admission decisions and opt-in pre-execute enforcement for DSH agents.",
   "type": "module",
   "license": "Apache-2.0",
   "main": "src/index.js",
@@ -36,6 +36,7 @@
     "budget",
     "quota",
     "admission",
+    "enforcement",
     "cost"
   ],
   "author": "PerryLink",

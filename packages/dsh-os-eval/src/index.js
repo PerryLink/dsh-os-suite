@@ -1,5 +1,6 @@
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { createEvalStore } from './core.js'
+import { readSessionFile, summarizeSession, summarizeTrajectory } from './session.js'
 
 export const name = 'dsh-os-eval'
 export const inject = ['tools']
@@ -14,7 +15,8 @@ const output = {
  * @property {import('./core.js').EvalCase[]} [cases] Cases loaded at activation.
  * @property {import('./core.js').Baseline[]} [baselines] Baselines loaded at activation.
  * @property {(evalCase: import('./core.js').EvalCase) => object} [runner] Optional
- *   synchronous host runner. When absent, `eval_run` uses its mock argument.
+ *   synchronous host runner. Used only when `eval_run` receives no `sessionFile`;
+ *   when neither is present, `eval_run` falls back to its mock argument.
  */
 
 /**
@@ -27,6 +29,8 @@ const output = {
 export function apply(ctx, config = {}) {
   const options = config ?? {}
   const store = createEvalStore()
+  /** @type {Map<string, object>} Latest recorded-session summary per case. */
+  const trajectories = new Map()
 
   for (const evalCase of options.cases ?? []) store.defineCase(evalCase)
   for (const baseline of options.baselines ?? []) store.setBaseline(baseline)
@@ -38,8 +42,9 @@ export function apply(ctx, config = {}) {
   ctx.tools.register(defineTool({
     name: 'eval_run',
     description:
-      'Run one eval case through an injected mock runner, grade it, and record the latest run. '
-      + 'Never calls a model or reads a session.',
+      'Run one eval case from a recorded session JSONL file, an injected host runner, or the '
+      + 'mock fallback, grade it, and record the latest run. Never calls a model; a sessionFile '
+      + 'is read from the one explicit path supplied by the caller.',
     parameters: {
       caseId: {
         type: 'string',
@@ -51,11 +56,18 @@ export function apply(ctx, config = {}) {
         description:
           'Optional inline Case { id, name, input, expect, tags? }. Defining an existing id is an error.',
       },
+      sessionFile: {
+        type: 'string',
+        description:
+          'Path to one exported, uncompressed DSH session .jsonl file. Takes precedence over a '
+          + 'host runner and the mock. The final assistant text, paired tool-call count, and '
+          + 'summed usage are graded by the case expectations.',
+      },
       mock: {
         type: 'object',
         additionalProperties: false,
         description:
-          'Mock runner result. Used only when apply() did not inject a host runner. '
+          'Mock runner result. Used only when neither sessionFile nor a host runner is present. '
           + 'Defaults: output echoes the case input, steps/tokens/latencyMs are 0.',
         properties: {
           output: { type: 'json', description: 'Mock output; defaults to the case input as text.' },
@@ -86,9 +98,25 @@ export function apply(ctx, config = {}) {
     async execute(args) {
       if (args.case !== undefined) store.defineCase(args.case)
 
-      const mock = args.mock ?? {}
-      const runner = options.runner ?? ((evalCase) => createMockRun(evalCase, mock))
-      const run = store.runCase(args.caseId, runner)
+      let run
+      let trajectory = null
+      if (args.sessionFile !== undefined) {
+        const session = readSessionFile(args.sessionFile)
+        const summary = summarizeSession(session)
+        run = store.runCase(args.caseId, () => ({
+          output: summary.output,
+          steps: summary.steps,
+          tokens: summary.tokens,
+          latencyMs: summary.latencyMs,
+        }))
+        trajectory = summarizeTrajectory(session)
+        trajectories.set(args.caseId, trajectory)
+      } else {
+        const mock = args.mock ?? {}
+        const runner = options.runner ?? ((evalCase) => createMockRun(evalCase, mock))
+        run = store.runCase(args.caseId, runner)
+        trajectories.delete(args.caseId)
+      }
 
       let comparison = null
       if (args.baseline !== undefined) {
@@ -99,7 +127,7 @@ export function apply(ctx, config = {}) {
         })
       }
 
-      return { run, comparison }
+      return { run, comparison, trajectory }
     },
   }))
 
@@ -132,8 +160,9 @@ export function apply(ctx, config = {}) {
   ctx.tools.register(defineTool({
     name: 'eval_report',
     description:
-      'Summarise eval cases and their latest runs as counts, tokens, status, and failure reasons. '
-      + 'Never includes raw runner output.',
+      'Summarise eval cases and their latest runs as counts, tokens, status, failure reasons, and '
+      + 'compact recorded-trajectory summaries. Never includes raw runner output, tool arguments, '
+      + 'or tool results.',
     parameters: {
       tags: {
         type: 'array',
@@ -143,9 +172,50 @@ export function apply(ctx, config = {}) {
     },
     output,
     async execute(args) {
-      return store.report(args)
+      const report = store.report(args)
+      return withTrajectorySummaries(report, trajectories)
     },
   }))
+}
+
+/**
+ * Attach the latest recorded-session summary to each report case and aggregate
+ * the selected summaries. The aggregate deliberately carries only counts and
+ * tool names so `eval_report` remains a summary channel.
+ *
+ * @param {{ cases: object[] }} report Store report.
+ * @param {Map<string, object>} trajectories Latest trajectory summary per case id.
+ * @returns {object} Report extended with per-case and aggregate `trajectory` fields.
+ */
+function withTrajectorySummaries(report, trajectories) {
+  const aggregate = {
+    sessions: 0,
+    turns: 0,
+    messages: 0,
+    steps: 0,
+    tokens: 0,
+    latencyMs: 0,
+    toolErrors: 0,
+    tools: {},
+  }
+  const cases = report.cases.map((entry) => {
+    const trajectory = trajectories.get(entry.caseId) ?? null
+    if (trajectory === null) return { ...entry, trajectory }
+
+    aggregate.sessions += 1
+    aggregate.turns += trajectory.turns
+    aggregate.messages += trajectory.messages
+    aggregate.steps += trajectory.steps
+    aggregate.tokens += trajectory.tokens
+    aggregate.latencyMs += trajectory.latencyMs
+    aggregate.toolErrors += trajectory.toolErrors
+    for (const tool of trajectory.tools) {
+      aggregate.tools[tool] = (aggregate.tools[tool] ?? 0) + 1
+    }
+    return { ...entry, trajectory }
+  })
+
+  return { ...report, cases, trajectory: aggregate }
 }
 
 /**

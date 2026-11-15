@@ -3,8 +3,9 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { apply, inject, name } from '../src/index.js'
+import { apply, inject, name, verifySignedBundle } from '../src/index.js'
 import { TraceError } from '../src/core.js'
+import { createFakeCtx, toolsByName } from './fake-ctx.js'
 
 const T0 = 1_700_000_000_000
 
@@ -12,21 +13,9 @@ const T0 = 1_700_000_000_000
  * @param {Record<string, unknown>} [config]
  */
 function setup(config = {}) {
-  /** @type {any[]} */
-  const definitions = []
-  const ctx = {
-    tools: {
-      register(definition) {
-        definitions.push(definition)
-        return () => {}
-      },
-    },
-  }
+  const ctx = createFakeCtx()
   apply(ctx, config)
-  /** @type {Record<string, any>} */
-  const tools = {}
-  for (const definition of definitions) tools[definition.name] = definition
-  return { definitions, tools }
+  return { ctx, definitions: ctx.definitions, tools: toolsByName(ctx.definitions) }
 }
 
 /**
@@ -45,13 +34,13 @@ function span(id, overrides = {}) {
   }
 }
 
-test('apply registers the four trace tools with schemas', () => {
+test('apply registers the five trace tools with schemas', () => {
   const { definitions, tools } = setup({ now: () => T0 })
   assert.equal(name, 'dsh-os-trace')
   assert.deepEqual(inject, ['tools'])
   assert.deepEqual(
     definitions.map((definition) => definition.name),
-    ['trace_query', 'trace_why', 'trace_export', 'trace_verify'],
+    ['trace_query', 'trace_why', 'trace_export', 'trace_verify', 'trace_live_status'],
   )
   for (const definition of definitions) {
     assert.ok(definition.parameters)
@@ -60,6 +49,7 @@ test('apply registers the four trace tools with schemas', () => {
   }
   assert.deepEqual(Object.keys(tools).sort(), [
     'trace_export',
+    'trace_live_status',
     'trace_query',
     'trace_verify',
     'trace_why',
@@ -166,4 +156,93 @@ test('apply reports invalid config instead of starting an empty store', () => {
     () => setup({ dataFile: '/definitely/not/here/spans.jsonl' }),
     (error) => error instanceof TraceError && error.code === 'INVALID_DATA_FILE',
   )
+  assert.throws(
+    () => setup({ ingest: 'yes' }),
+    (error) => error instanceof TraceError && error.code === 'INVALID_OPTIONS',
+  )
+  assert.throws(
+    () => setup({ secret: '' }),
+    (error) => error instanceof TraceError && error.code === 'INVALID_OPTIONS',
+  )
+})
+
+test('trace_live_status reports collector state and ingest:false disables attach', async () => {
+  const { ctx, tools } = setup({ now: () => T0 })
+  const initial = await tools.trace_live_status.execute({}, {})
+  assert.equal(initial.attached, true)
+  assert.equal(initial.running, 0)
+  assert.equal(initial.finalized, 0)
+
+  ctx.emit('tools/pre-execute', {
+    callId: 'call-live',
+    name: 'read_file',
+    agent: { id: 'session-1', session: { id: 'session-1' } },
+  })
+  const running = await tools.trace_live_status.execute({}, {})
+  assert.equal(running.running, 1)
+  assert.equal(running.events, 1)
+  assert.equal(running.mapped, 1)
+
+  ctx.emit('tools/post-execute', { callId: 'call-live', name: 'read_file' }, {
+    isError: false,
+    content: [],
+  })
+  const finalized = await tools.trace_live_status.execute({}, {})
+  assert.equal(finalized.running, 0)
+  assert.equal(finalized.finalized, 1)
+  assert.ok(finalized.subscribed.includes('session/event'))
+
+  const disabled = setup({ now: () => T0, ingest: false })
+  const off = await disabled.tools.trace_live_status.execute({}, {})
+  assert.equal(off.attached, false)
+  assert.equal(off.subscriptions, 0)
+  disabled.ctx.emit('tools/pre-execute', { callId: 'ignored', name: 'x' })
+  const queried = await disabled.tools.trace_query.execute({}, {})
+  assert.equal(queried.count, 0)
+})
+
+test('trace_export sign:true uses config.secret or TESTATUM_KEY and never leaks it', async () => {
+  const { tools } = setup({
+    now: () => T0,
+    secret: 'config-secret',
+    spans: [span('signed-root', { kind: 'workflow', name: 'run', attrs: { apiKey: 'sk-live' } })],
+  })
+  const signed = await tools.trace_export.execute({ sign: true }, {})
+  assert.equal(signed.signature.alg, 'hmac-sha256')
+  assert.match(signed.signature.sig, /^[0-9a-f]{64}$/)
+  assert.equal(JSON.stringify(signed).includes('config-secret'), false)
+  assert.equal(verifySignedBundle(signed, 'config-secret').ok, true)
+
+  const tampered = structuredClone(signed)
+  tampered.spans[0].name = 'tampered'
+  assert.equal(verifySignedBundle(tampered, 'config-secret').ok, false)
+
+  const unsigned = await tools.trace_export.execute({}, {})
+  assert.equal(unsigned.signature, undefined)
+
+  const redactedSigned = await tools.trace_export.execute({ redact: ['apiKey'], sign: true }, {})
+  assert.equal(JSON.stringify(redactedSigned).includes('sk-live'), false)
+  assert.equal(redactedSigned.redaction.applied, true)
+  assert.equal(verifySignedBundle(redactedSigned, 'config-secret').ok, true)
+
+  const previous = process.env.TESTATUM_KEY
+  delete process.env.TESTATUM_KEY
+  try {
+    const noSecret = setup({ now: () => T0, spans: [span('no-secret')] })
+    await assert.rejects(
+      () => noSecret.tools.trace_export.execute({ sign: true }, {}),
+      (error) =>
+        error instanceof TraceError &&
+        error.code === 'SIGNING_KEY_MISSING' &&
+        !error.message.includes('secret-'),
+    )
+
+    process.env.TESTATUM_KEY = 'env-secret'
+    const fromEnv = await noSecret.tools.trace_export.execute({ sign: true }, {})
+    assert.equal(JSON.stringify(fromEnv).includes('env-secret'), false)
+    assert.equal(verifySignedBundle(fromEnv).ok, true)
+  } finally {
+    if (previous === undefined) delete process.env.TESTATUM_KEY
+    else process.env.TESTATUM_KEY = previous
+  }
 })

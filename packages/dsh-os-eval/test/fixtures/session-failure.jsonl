@@ -1,0 +1,12 @@
+{"type":"session","version":4,"id":"fixture-failure","createdAt":0,"cwd":"/tmp/dsh-os-eval","isSeeded":false,"delegationDepth":0}
+{"type":"turn/start","seq":1,"time":2000,"data":{"turn":1}}
+{"type":"step/start","seq":2,"time":2001,"data":{"turn":1,"step":1}}
+{"type":"assistant/message","seq":3,"time":2002,"data":{"turn":1,"step":1,"message":{"role":"assistant","content":[{"type":"tool-call","id":"call-bad","name":"read","arguments":"{\"path\":\"missing.txt\"}"}],"source":{"kind":"model","provider":"fixture","model":"fixture"},"id":"msg-1"}},"surfaceOp":"append"}
+{"type":"tool/call","seq":4,"time":2003,"data":{"turn":1,"step":1,"callId":"call-bad","name":"read","arguments":"{\"path\":\"missing.txt\"}"}}
+{"type":"tool/result","seq":5,"time":2004,"data":{"turn":1,"step":1,"message":{"role":"tool","source":{"kind":"tool","callId":"call-bad"},"toolCallId":"call-bad","content":[{"type":"text","text":"ENOENT: no such file or directory"}],"isError":true,"id":"res-1"}},"surfaceOp":"append"}
+{"type":"turn/end","seq":6,"time":2005,"data":{"turn":1,"reason":{"kind":"error"}}}
+{"type":"turn/start","seq":7,"time":2006,"data":{"turn":2}}
+{"type":"assistant/message","seq":8,"time":2007,"data":{"turn":2,"step":1,"message":{"role":"assistant","content":[{"type":"text","text":"I could not finish. The expected marker is absent."}],"source":{"kind":"model","provider":"fixture","model":"fixture"},"id":"msg-2"},"usage":{"inputTokens":900,"outputTokens":99}},"surfaceOp":"append"}
+{"type":"turn/end","seq":9,"time":2008,"data":{"turn":2,"reason":{"kind":"completed"}}}
+{"type":"tool/result","seq":10,"time":2009,"data":{"turn":2,"step":1,"message":
+{"type":"future/event","data":{"unknown":true,"turn":2}}

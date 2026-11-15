@@ -105,15 +105,25 @@ workflow uses.
 ## What the workflows do
 
 `CI` (`.github/workflows/ci.yml`) runs on every push to `main`, every pull
-request, and on demand, with a Node `22.19.0` / `24` matrix:
+request, and on demand. The `test` job runs Node `24` on Linux, Windows and
+macOS, plus the Node `22.19.0` lower bound on Linux:
 
 1. `npm ci --ignore-scripts` (lockfile is committed).
 2. `npm test`.
-3. `node --check` for every `packages/*/src/*.js`.
-4. CLI smoke: `<bin> --version` and `<bin> --help` for every package that
+3. Coverage on Node 24: `node --test --experimental-test-coverage`, uploaded as
+   a `coverage-<os>-node-24` artifact. There is **no coverage threshold yet**;
+   the report is for observation only.
+4. `node --check` for every `packages/*/src/*.js`.
+5. CLI smoke: `<bin> --version` and `<bin> --help` for every package that
    declares a `bin`. These six packages are library-only today, so the step
    logs a notice and passes; it will exercise a future CLI automatically.
-5. `node scripts/smoke-pack.mjs`.
+6. `node scripts/smoke-pack.mjs`.
+
+The separate `dsh-smoke` job (Linux only) packs all six workspaces, installs the
+tarballs into a throwaway `DSH_HOME` with `@deepseek-ai/dsh@0.2.2-rc.3`, and
+requires `--dump-config` to contain exactly six `# == dsh-os-*` sections. The
+job prints the install/dump logs when a step fails and removes the temporary
+home afterwards.
 
 `Release` (`.github/workflows/release.yml`) runs on tags matching `v*`:
 
@@ -163,12 +173,19 @@ Permissions are deliberately minimal: `contents: read` and `id-token: write`.
      npm view "$pkg@0.1.2" version
    done
    ```
-6. Smoke-install in an isolated DSH profile (do not touch a real profile):
+6. Smoke-install all six packages in an isolated DSH profile (do not touch a
+   real profile; `pnpm` must be on `PATH` because `dsh plugin` forwards to it):
    ```sh
-   DSH_HOME=/tmp/dsh-stage-home npx --yes @deepseek-ai/dsh plugin --profile web add dsh-os-trace@0.1.2
-   DSH_HOME=/tmp/dsh-stage-home npx --yes @deepseek-ai/dsh --profile web --dump-config | grep dsh-os-
+   export DSH_HOME="$(mktemp -d)"
+   npx --yes @deepseek-ai/dsh@0.2.2-rc.3 plugin --profile web add \
+     dsh-os-catalog@0.1.2 dsh-os-eval@0.1.2 dsh-os-lease@0.1.2 \
+     dsh-os-quota@0.1.2 dsh-os-registry@0.1.2 dsh-os-trace@0.1.2
+   npx --yes @deepseek-ai/dsh@0.2.2-rc.3 --profile web --dump-config \
+     | grep '^# == dsh-os-'
    ```
-   The dump should list the six `dsh-os-*` entries. Remove the isolated
+   The dump must print exactly six `# == dsh-os-*` lines. This is the same
+   assertion CI's `dsh-smoke` job makes, except CI installs locally packed
+   tarballs before a release instead of the registry versions. Remove
    `DSH_HOME` afterwards.
 
 ## Rollback

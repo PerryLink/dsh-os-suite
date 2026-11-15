@@ -1,5 +1,8 @@
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { createGovernor } from './core.js'
+import { createEnforcer } from './enforce.js'
+
+export { createEnforcer, QuotaDeniedError } from './enforce.js'
 
 export const name = 'dsh-os-quota'
 export const inject = ['tools']
@@ -51,8 +54,14 @@ const optionalAmountParams = {
   diskMb: { type: 'number', description: 'Disk MB to charge (non-negative; negative values book 0).' },
 }
 
+/** @param {unknown} value @returns {boolean} */
+function isRecord(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
 /**
- * Register the four quota tools.
+ * Register the four budget tools plus `quota_enforce_status`, and attach the
+ * opt-in pre-execute gate when `config.enforce` is true.
  *
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {object} [config] Optional Cordis plugin config.
@@ -63,15 +72,53 @@ const optionalAmountParams = {
  * @param {import('./core.js').Scope[]} [config.scopes] Optional seed scopes.
  * @param {(() => number | Date) | number | Date} [config.now] Optional clock
  *   override; intended for embedding and tests, not for normal profiles.
+ * @param {boolean | {enabled?: boolean, scope?: string, costOf?: object | Function, onDeny?: Function, throwOnDeny?: boolean, ignore?: string[]}} [config.enforce]
+ *   Opt-in tool-call enforcement. `true` attaches the `tools/pre-execute`
+ *   waterfall and the result-usage consumer. Pass an object to configure the
+ *   same adapter inline (`enabled` defaults to true in that form).
+ * @param {string | ((call: object) => string)} [config.scope] Scope used by the
+ *   enforcement adapter when a call does not name one.
+ * @param {Record<string, unknown> | ((name: string, call: object) => unknown)} [config.costOf]
+ *   Per-tool cost estimate. A number means tokens; an object may contain
+ *   `tokens`, `jobs` and `diskMb`.
+ * @param {Record<string, unknown>} [config.costs] Convenience map used as
+ *   `costOf` when `config.costOf` is absent.
+ * @param {(decision: object, call: object, error: Error) => void} [config.onDeny]
+ *   Observer called on every hard denial.
+ * @param {boolean} [config.throwOnDeny=false] Throw instead of returning a
+ *   denial object (returning is preferred by the DSH waterfall contract).
+ * @param {string[]} [config.enforceIgnore] Additional tool names never gated;
+ *   `quota_*` tools are always ignored.
  */
 export function apply(ctx, config = {}) {
-  const options = config !== null && typeof config === 'object' ? config : {}
+  const options = isRecord(config) ? config : {}
   const governor = createGovernor({
     now: options.now,
     limits: options.limits,
     softRatio: options.softRatio,
     windowMs: options.windowMs,
     scopes: options.scopes,
+  })
+
+  const enforceOption = options.enforce
+  const enforcePolicy = isRecord(enforceOption) ? enforceOption : {}
+  const enforceEnabled = enforceOption === true || (isRecord(enforceOption) && enforcePolicy.enabled !== false)
+  const costs = isRecord(options.costs) ? options.costs : undefined
+  const costOf = enforcePolicy.costOf
+    ?? options.costOf
+    ?? (costs === undefined
+      ? undefined
+      : (toolName) => Object.hasOwn(costs, toolName) ? costs[toolName] : costs['*'])
+
+  const enforcer = createEnforcer({
+    governor,
+    enabled: enforceEnabled,
+    costOf,
+    scope: enforcePolicy.scope ?? options.enforceScope ?? options.scope,
+    onDeny: enforcePolicy.onDeny ?? options.onDeny,
+    throwOnDeny: enforcePolicy.throwOnDeny ?? options.throwOnDeny,
+    ignore: enforcePolicy.ignore ?? options.enforceIgnore,
+    now: options.now,
   })
 
   ctx.tools.register(
@@ -118,7 +165,8 @@ export function apply(ctx, config = {}) {
       name: 'quota_admit',
       description:
         'Project a prospective token/job/disk spend without booking it. Returns allowed=true at ok or soft ' +
-        '(soft means degraded: degrade=true), and allowed=false at hard. Advisory only in this MVP.',
+        '(soft means degraded: degrade=true), and allowed=false at hard. The tool itself is advisory; ' +
+        'pre-execute enforcement is configured separately with enforce=true.',
       parameters: {
         scope: scopeParam,
         ...optionalAmountParams,
@@ -146,6 +194,41 @@ export function apply(ctx, config = {}) {
       },
     }),
   )
+
+  ctx.tools.register(
+    defineTool({
+      name: 'quota_enforce_status',
+      description:
+        'Report opt-in pre-execute enforcement: whether the host hook is attached, the policy/config in use, ' +
+        'admission/denial/degradation counters, the last decision, and the current scope ledgers. ' +
+        'Read-only; it never changes a budget and is itself never gated.',
+      parameters: {
+        scope: { type: 'string', description: 'Optional scope id whose ledger to include as scopeStatus.' },
+      },
+      output,
+      isConcurrencySafe: () => true,
+      async execute(args) {
+        const snapshot = enforcer.status()
+        return {
+          ...snapshot,
+          scopes: governor.list(),
+          ...(typeof args.scope === 'string' && args.scope !== ''
+            ? { scopeStatus: governor.status(args.scope) }
+            : {}),
+        }
+      },
+    }),
+  )
+
+  if (enforceEnabled) enforcer.attach(ctx)
+
+  // Keep apply()'s public return value (the governor) stable while exposing the
+  // adapter for embedding/tests without changing enumerable shape.
+  Object.defineProperty(governor, 'enforcer', {
+    value: enforcer,
+    enumerable: false,
+    configurable: true,
+  })
 
   return governor
 }

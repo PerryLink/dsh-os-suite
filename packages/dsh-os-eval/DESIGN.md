@@ -1,7 +1,8 @@
 # dsh-os-eval — design
 
-Status: 0.1.0 MVP (2026-11-14). Pure ESM, no build. Core logic is offline-testable
-and imports no `@deepseek-ai/*` package.
+Status: 0.1.2 (2026-11-15). Pure ESM, no build. Core logic is offline-testable
+and imports no `@deepseek-ai/*` package. The read-only exported-JSONL adapter
+lives in `src/session.js`; it adds I/O only for the one file a caller names.
 
 ## 1. Problem
 
@@ -134,15 +135,23 @@ const run = store.runCase('greeting', (evalCase) => ({
 ```
 
 The default plugin mock echoes `case.input` and reports zero cost. It is a gate
-fixture, not an evaluator. A real adapter will translate a recorded session or a
-fresh agent run into the same run shape; the scorer and gate do not change.
+fixture, not an evaluator. The 0.1.2 adapter translates one exported session
+into the same run shape; the scorer and gate do not change.
+
+`src/session.js` parses plain-text DSH session JSONL, pairs `tool/call` with
+`tool/result` on the call id, and exposes `parseSessionJsonl`, `trajectoryOf`,
+`replay`, and `evaluate`. `eval_run` accepts one explicit `sessionFile` path;
+`eval_report` adds a compact trajectory summary. There is no live-session,
+session-query, OTel, or compressed-log read.
 
 Trajectory storage is deliberately outside core. This keeps the package free of
 session schemas and makes the data policy simple: summaries in, summaries out.
+Raw messages, tool arguments, and tool results are returned to a programmatic
+`replay` caller but never stored or reported by the plugin.
 
 ## 6. Scorers
 
-The 0.1 scorer is rule-based and synchronous:
+The scorer is rule-based and synchronous:
 
 | Expectation | Pass condition | Failure reason |
 |---|---|---|
@@ -197,22 +206,33 @@ Edge cases:
 
 ## 8. Integration points
 
-### session-query
+### Exported session JSONL (implemented in 0.1.2)
 
-Planned adapter, outside core:
+`src/session.js` is the adapter:
 
-1. Query a recorded session (or a normalized projection from `session-query`)
-   by session id or tag.
-2. Extract the fields needed for a `Run`: final output, number of agent/tool
-   steps, token usage, latency. Ignore message bodies and tool payloads unless a
-   case explicitly needs them.
-3. Either replay recorded outputs as a deterministic fixture, or re-run the
-   scenario in a sandbox and compare the new trajectory.
-4. Feed the resulting `Run` to the existing scorer/gate.
+1. Read one caller-supplied, uncompressed `.jsonl` export.
+2. Parse `turn/*`, `step/*`, `tool/call`, `tool/result`, and
+   `assistant/message`; ignore malformed lines and unknown events/fields.
+3. Pair tool calls and results by call id; derive final assistant text, paired
+   step count, summed token usage, and event-span latency.
+4. Feed the resulting `Run` to the existing scorer/gate; expose per-step replay
+   through a synchronous callback.
 
-The adapter should live in a separate module/package so `core.js` never gains a
-session dependency and stays offline-testable. Query failures should surface as
-adapter errors before any run is recorded, not as a fake PASS.
+The module imports `core.js` and `node:fs` only. `core.js` remains free of
+session schemas and I/O. Read failures surface as adapter errors before a run is
+recorded, not as a fake PASS.
+
+### session-query (not implemented)
+
+Live session-query reads are out of scope for 0.1.2. The current boundary is one
+exported file; there is no query-by-id/tag, no session-root discovery, and no
+session service injection.
+
+### OTel (not implemented)
+
+DSH and host runtimes can export GenAI spans (model call, tool call, token usage,
+duration), but this package does not consume them. If an OTel adapter is added
+later, the planned mapping is:
 
 ### OTel
 
@@ -233,7 +253,7 @@ bundle for audit.
 
 ### CI
 
-0.1 has no CLI. A CI job imports the core or drives the tools and maps:
+0.1.2 has no CLI. A CI job imports the core or drives the tools and maps:
 
 | Verdict | Proposed exit code | Meaning |
 |---|---|---|
@@ -249,7 +269,7 @@ can be posted as a PR check without parsing prose.
 | Failure | Observable effect | Mitigation |
 |---|---|---|
 | Brittle `contains` | PASS becomes FAIL after harmless wording changes | Prefer `equals` for structured data; review fixtures; tag flaky cases separately. |
-| Nondeterministic output | Same case flips between PASS/FAIL | 0.1 runs once; add repeated runs and flake rate in 0.2. |
+| Nondeterministic output | Same case flips between PASS/FAIL | 0.1.2 runs once; add repeated runs and flake rate in 0.2. |
 | Token accounting drift | WARN without a real behaviour regression | Normalize tokenizer/route; version baselines; re-baseline deliberately. |
 | Stale baseline | Gate passes while cost keeps rising | CI refresh job and baseline age in a future release. |
 | Missing run | Silent gap in a partial suite | `eval_report` shows `NOT_RUN`; all-unrun gate is FAIL; strict full-coverage mode planned. |
@@ -262,10 +282,9 @@ can be posted as a PR check without parsing prose.
 
 ## 10. Security and privacy
 
-- Core has no I/O. The plugin registers tools only.
-- No raw trajectories, prompts, or messages are persisted by this package.
-- `eval_report` returns status, metrics, and reasons only; `eval_run` returns the
-  run object including output to its caller.
+- Core has no I/O; the session adapter reads only the one `sessionFile` path a caller names.
+- No raw messages, prompts, tool arguments, or tool results are persisted by this package; reports carry counts, tool names, and error counts only.
+- `eval_report` returns status, metrics, reasons, and compact trajectory summaries; `eval_run` returns the run object including output to its caller.
 - Cases are trusted configuration. They are not a sandbox; an injected runner
   runs with host permissions.
 - Baselines contain only pass rate and p50 tokens.
@@ -275,7 +294,7 @@ can be posted as a PR check without parsing prose.
 | Window | Work | Exit criterion |
 |---|---|---|
 | Days 1–7 (2026-11-15 → 11-21) | Harden 0.1: fixture JSON loader, config validation, test coverage, pack dry-run, docs review. | `npm pack` succeeds; core tests green offline. |
-| Days 8–14 (11-22 → 11-28) | `session-query` read-only adapter; recorded-output replay fixture; baseline JSON format; redaction rules. | One recorded session can produce a `Run` without touching core. |
+| Days 8–14 (11-22 → 11-28) | Exported-JSONL replay landed in 0.1.2; remaining: live `session-query` read, baseline JSON format, redaction rules. | More than one exported session can produce a `Run` without touching core. |
 | Days 15–21 (11-29 → 12-05) | CLI (`run`/`gate`/`report`), exit codes, JUnit XML, repeated-run support (k, p50); OTel span adapter spike. | A local CI script blocks on FAIL and annotates WARN. |
 | Days 22–30 (12-06 → 12-14) | GitHub Actions example, strict coverage mode, baseline freshness policy, security review, naming recheck, 0.2.0. | A real repository runs the gate in CI; release notes list adapters and limits. |
 

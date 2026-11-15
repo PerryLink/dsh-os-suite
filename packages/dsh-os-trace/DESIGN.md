@@ -1,6 +1,6 @@
 # DESIGN — dsh-os-trace
 
-> 状态：0.1.0 MVP。本文描述**已实现的行为**与**明确的未来接线点**，不把计划写成现状。
+> 状态：0.1.2 + 实时采集/HMAC 签名（未发布）。本文描述**已实现的行为**与**明确的未来接线点**，不把计划写成现状。
 
 ## 1. 目标与非目标
 
@@ -9,38 +9,40 @@
 1. **因果可解释**：给定一个事件 id，返回它和祖先/后代组成的 span 子图与边。
 2. **可验证的证据包**：span 进入一条 SHA-256 哈希链；导出 bundle 后，任何单点修改、重排、错误拼接都能定位到第一个坏 span。
 3. **可安全分享**：按字段名递归脱敏，重新封链，使校验针对实际分享的字节。
-4. **零 DSH 依赖的核心**：`src/core.js` 不 import `@deepseek-ai/*`，`node --test` 可离线运行。
-5. **MVP 可嵌**：插件入口只做 store 创建、工具注册和只读 JSONL 导入，不写业务逻辑。
+4. **零 DSH 依赖的核心**：`src/core.js` 不 import `@deepseek-ai/*`，`node --test` 可离线运行；`ingest.js` / `sign.js` 同样可离线测试。
+5. **可嵌**：插件入口负责 store 创建、种子输入、五个工具注册和实时采集 attach；采集/签名逻辑不写进 `index.js`。
 
-### 非目标（0.1.0）
+### 非目标
 
 - 不做 OTel Collector/SDK，不导出 OTLP，不做 W3C trace context 传播。
 - 不替代 DSH session 日志、不建全局搜索、不做 UI。
-- 不做签名、PKI、透明日志或外部时间戳。
-- 不做 SQLite 持久化、跨进程共享、崩溃恢复。
-- 不做实时采集接线（见 §4，全部是规划）。
+- 不做 PKI、透明日志、外部时间戳或公钥签名；HMAC 是共享密钥 MAC，不是身份凭证。
+- 不做 SQLite 持久化、跨进程共享、崩溃恢复；实时采集不回放历史 session。
+- 不记录工具参数、消息正文或自由文本原因。
 
 ## 2. 架构
 
 ```text
 packages/dsh-os-trace/
   src/core.js   纯逻辑：规范化、哈希链、store、why、bundle、verify
-  src/index.js  Cordis 插件：createTraceStore + 4 个 defineTool + JSONL 只读导入
-  test/         core.test.js（领域行为）+ index.test.js（工具/schema 接线）
+  src/ingest.js 实时采集：事件 → span、配对/去重、terminal 才 ingest
+  src/sign.js   HMAC-SHA256 签名/验签（testatum-attest v1 载荷约定）
+  src/index.js  Cordis 插件：createTraceStore + 5 个 defineTool + 种子输入 + attach
+  test/         core / ingest / sign / index 四组离线测试
 ```
 
 数据流：
 
 ```text
-JSONL / config.spans
-        │  (apply 时一次)
-        ▼
-  createTraceStore ── ingest ──► 内存 span[] + byId + childrenByParent + ingestOrder
-        │
-        ├── query(filter) ──► Span[]
-        ├── why(id, depth) ──► 子图 + edges + missing
-        ├── exportBundle({redact}) ──► bundle（可能重新封链）
-        └── verifyBundle(bundle) ──► { ok, firstBad, ... }（无状态，可独立调用）
+DSH events (ctx.on) ──► createIngest ──┐
+                                      ├── terminal span ──► createTraceStore.ingest
+JSONL / config.spans ─────────────────┘                         │
+                                                                ├── query(filter) ──► Span[]
+                                                                ├── why(id, depth) ──► 子图 + edges + missing
+                                                                ├── exportBundle({redact}) ──► bundle（可能重新封链）
+                                                                └── verifyBundle(bundle) ──► { ok, firstBad, ... }
+                                                                       │
+                                                                       └── signBundle(bundle, secret) ──► signature
 ```
 
 没有模块级可变状态：所有 store 状态在 `createTraceStore()` 闭包里；`verifyBundle` 是纯函数（输入 bundle，输出结果）。
@@ -55,7 +57,7 @@ JSONL / config.spans
 | `parentId` | string | 否 | 因果父 id；允许指向尚未 ingest 的 id（形成 missing 链） |
 | `sessionId` | string | 是 | 来源 DSH session；非空 |
 | `agentPath` | string | 否 | 例如 `lead/researcher`；允许空串 |
-| `kind` | enum | 是 | `tool` / `subagent` / `job` / `approval` / `mcp` / `workflow` |
+| `kind` | enum | 是 | `tool` / `subagent` / `job` / `approval` / `mcp` / `session` / `workflow` |
 | `name` | string | 是 | 操作名；非空 |
 | `startMs` | number | 是 | epoch 毫秒；有限值 |
 | `endMs` | number | 否 | epoch 毫秒；`>= startMs` |
@@ -88,9 +90,9 @@ JSONL / config.spans
   - `truncated` 表示还有节点因深度上限未纳入。
 - 深度上限 64，避免一次调用失控；`0` 表示只要 target 本身。
 
-## 4. 集成点（当前均未接线）
+## 4. 集成点（已接线，尽力而为）
 
-下面描述的是**适配器契约**，不是 0.1.0 已实现的功能。接线时应保持「只读事件 → 内存/JSONL」的单向性，禁止写回 session 数据。
+`src/ingest.js` 已按下面的契约订阅 `session/event`、`tools/pre-execute`、`tools/post-execute`、`tool/result` 以及 approval/agent/subagent/job/mcp 家族事件。Cordis 没有通配符派发，所以实现同时枚举已知具体事件名，并用 `internal/dispatch` 做未知家族兜底。未知事件忽略，采集失败不阻塞主循环。
 
 | 来源 | 建议 `kind` | 建议 `name` | 关键 `attrs`（示例） | 关系 |
 |---|---|---|---|---|
@@ -122,8 +124,8 @@ JSONL / config.spans
 | 导出时只删尾部 | `spanCount`/`rootHash` 不一致 → `firstBad` | 若攻击者同步改这两个字段，需外部锚 |
 | 单点改字段 | `hash mismatch` | 定位到 index/id |
 | 重排 / 嫁接连 | `prevHash` 不匹配 | 定位到第一处断链 |
-| 整条链重算 | 校验通过 | **本质限制**：链不是签名；需要签名/外部锚 |
-| `exportedAt`/`sourceRootHash` 被改 | 不检测 | 这两个字段未封链；不要当证据 |
+| 整条链重算 | 未签名时校验通过；签名后 HMAC 失配（除非持有密钥重签） | **本质限制**：链本身不是签名；HMAC 也不是透明日志 |
+| `exportedAt`/`sourceRootHash` 被改 | 未签名时不检测；签名后 HMAC 失配 | 这两个字段不在哈希链里，但在签名载荷里；未签名时不要当证据 |
 | 脱敏漏字段 | 只按 key 名匹配，不改字符串内容 | 上游字段命名要规范；必要时先做值级审查 |
 | 脱敏过度 | `id`/`parentId` 等被替换会破坏引用 | 文档建议不要 redact 结构字段；后续可加保留字段规则 |
 | 超大 store | 一次导出/返回全量，可能超上下文 | 后续分片导出、游标查询 |
@@ -138,16 +140,19 @@ JSONL / config.spans
 
 - **能防**：拿到 bundle 后改一条 span、改哈希、重排、截断而不重算；意外损坏；JSONL 解析错误。
 - **不能防**：能完整重写 bundle 并重算所有哈希的攻击者；能篡改工具进程内存的攻击者；能伪造源事件的上游；没有外部锚时无法证明「这份 bundle 属于某次特定 run」。
-- **下一步**：对 `rootHash` 做 Ed25519 签名，或把 `rootHash` 锚定到 Git commit / 透明日志 / 可信时间戳，才能把「自洽」提升为「可归属」。
+- **已加**：HMAC-SHA256 签名覆盖除 `signature` 外的全部字段；持有同一密钥者可伪造，故只提升到「知道密钥的人签过」。
+- **下一步**：Ed25519 公钥签名，或把 `rootHash` 锚定到 Git commit / 透明日志 / 可信时间戳，才能把「自洽」提升为「可归属」。
 
 ## 6. 30 天路线
 
-### 第 1 周：实时采集 MVP（最大缺口）
+### 第 1 周：实时采集 MVP（已实现）
 
-- 实现只读 `session.event` 适配器：tool / subagent / job / approval / MCP / workflow → span。
+- 只读事件适配器：tool / subagent / job / approval / MCP / session → span。
 - 关联 id 规则与父链构造；缺失父节点只记 missing，不补假根。
-- JSONL append sink（可选 fsync），保留 `dataFile` 读取兼容。
-- 验收：一次真实 DSH run 能产生 ≥3 层因果链；`trace_why` 能跨 subagent/job 解释；采集失败不阻塞主循环。
+- 配对/去重；running span 保留在采集器视图，terminal 才进入哈希链。
+- 验收：`trace_live_status` 能观察配对与 running；采集失败不阻塞主循环。
+
+- 仍缺：JSONL append sink（可选 fsync）。
 
 ### 第 2 周：持久化与可操作性
 
@@ -158,8 +163,8 @@ JSONL / config.spans
 
 ### 第 3 周：证据强度与隐私
 
-- 对 `rootHash` 做 Ed25519 签名（密钥生命周期、轮换、公钥分发文档）。
-- 可选外部锚：把签名后的 root 写入 Git note / 透明日志适配器。
+- 已实现 HMAC-SHA256 签名（共享密钥，testatum-attest v1 载荷兼容）；仍缺 Ed25519 公钥签名、密钥生命周期/轮换/公钥分发。
+- 仍缺外部锚：把签名后的 root 写入 Git note / 透明日志适配器。
 - 脱敏策略 v2：路径规则、允许列表、结构字段保护、值级 secret 检测（谨慎，默认关闭）。
 - 发布 canonical JSON 测试向量，降低跨实现漂移。
 - 验收：篡改 + 重算的 bundle 能被签名/锚验证拒绝；脱敏后仍可通过签名验证。
@@ -169,11 +174,12 @@ JSONL / config.spans
 - 补齐 OTel **导入**（不是实时 OTel 后端）：把 OTLP/JSON 或 OTel span 映射为本模型，明确字段损失。
 - 文档、示例 run、npm `pack` 检查、版本范围复核。
 - 发布 0.1.x 到 npm；收集真实 run 的兼容性反馈。
-- 验收：干净环境 `dsh plugin add` + 四个工具可用；`npm pack --dry-run` 文件清单符合预期；README/DESIGN 无未实现承诺。
+- 验收：干净环境 `dsh plugin add` + 五个工具可用；`npm pack --dry-run` 文件清单符合预期；README/DESIGN 无未实现承诺。
 
 ## 7. 版本与兼容
 
 - bundle `format: "dsh-os-trace/bundle"`，`version: 1`；不兼容变更必须 bump `version`，并保留旧版 verifier。
 - `verifyBundle` 对未知 `format`/`version` 返回 `ok: false`，不做猜测性解析。
 - `core.js` 的公开函数：`createTraceStore`、`verifyBundle`、`canonicalJson`、`computeSpanHash`、`normalizeSpan`；语义变更按 semver 处理。
+- `ingest.js` 的公开入口：`createIngest`、`CORE_INGEST_EVENTS`、`FAMILY_INGEST_EVENTS`。`sign.js` 的公开入口：`signBundle`、`verifySignedBundle`、`signaturePayload`、`SIGN_ALG`、`SECRET_ENV`。
 - 包要求 DSH `>=0.2.2-rc.3 <0.3.0`；DSH 事件 API 变化时，适配器单独发版，不改动已导出的 bundle 格式。

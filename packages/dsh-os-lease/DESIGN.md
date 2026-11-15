@@ -141,7 +141,9 @@ On success the patchset is stored as `prepared` and a snapshot is returned.
    (`LEASE_EXPIRED` / `LEASE_RELEASED` otherwise).
 3. Transition to `committed`, set `committedAt`.
 4. Return `files` projected to `{ path, after }` and **sorted by path**. This is
-   the write set. No file operation occurs.
+   the write set. Core performs no file operation; the opt-in applier
+   (`src/apply.js`) executes it when the plugin is configured with
+   `apply: true` and `root`.
 
 ### Rollback
 
@@ -180,9 +182,13 @@ rollback is an error.
 - `workspace_rollback` → `rollbackPatchset`
 - `workspace_status` → `status`
 
-Tool code only selects the core operation. Core errors are surfaced with their
-stable `code` prefix so an agent can react (`CONFLICT`, `LEASE_EXPIRED`,
-`ALREADY_COMMITTED`, ...).
+Tool code only selects the core operation. When the plugin config contains
+`apply: true` and `root`, `workspace_apply` additionally passes the prepared
+patchset to `src/apply.js`, and `workspace_rollback` first restores the matching
+journal. Core errors are surfaced with their stable `code` prefix so an agent
+can react (`CONFLICT`, `LEASE_EXPIRED`, `ALREADY_COMMITTED`, ...); applier errors
+use `INVALID_PATH`, `PATH_ESCAPE`, `LOCKED`, `BACKUP_MISSING`,
+`ROLLBACK_FAILED`, and similar codes.
 
 ### Worktree integration
 
@@ -200,21 +206,24 @@ top-level paths that matter, for example `["src"]` and `["tests"]`.
 
 ### fs-intent / edit integration
 
-A future applier should wrap file-writing tools:
+The opt-in applier (`src/apply.js`) implements the file-writing half:
 
-1. Before the first write, ensure an active lease covers the path (or acquire
-   one automatically).
-2. Build the complete change list and call `preparePatchset` once per logical
-   change, including real pre-images read from disk.
-3. Perform writes in returned path order, ideally to temp files followed by
-   atomic renames; verify each `before` immediately before replacing.
-4. On success call `commitPatchset`; on any failure call `rollbackPatchset` and
-   use the returned pre-images.
-5. Renew long operations; release the lease at task end.
+1. Before writing, it checks that each path is inside the canonical `root` and
+   refuses symbolic links and the reserved `.dsh-os-lease` tree.
+2. It acquires one `fs.open(..., 'wx')` lock file per normalized path, then
+   backs up the real pre-images to
+   `.dsh-os-lease/journal/<patchsetId>/backups/`.
+3. It writes each file via temp file + fsync + rename, then marks the journal
+   `applied`.
+4. On any apply failure it restores the journaled entries in reverse order.
+   `workspace_rollback` / `rollback(journal)` restores pre-images, deletes new
+   files, and removes directories the apply created when empty.
+5. The plugin calls the applier only when configured with `apply: true` and
+   `root`; otherwise it returns the plan exactly as before.
 
-The current MVP stops after step 2 and returns the plan from `commit`. This is
-intentional: it keeps `core.js` offline-testable and prevents the lease layer
-from becoming an unverified file writer.
+`core.js` remains offline-testable and never touches the filesystem. The
+applier is a separate module precisely so the lease/plan layer cannot become an
+unverified file writer by default.
 
 ### Cordis / future service layer
 
@@ -236,24 +245,32 @@ not MVP.
 | Duplicate rollback | `ALREADY_ROLLED_BACK` | Treat as terminal; do not retry blindly |
 | Two prepared patchsets overlap | Second `prepare` throws `PATCHSET_CONFLICT` | Commit/rollback the first, or stage disjoint paths |
 | Patchset touches unleased paths | `prepare` throws `PATH_NOT_LEASED` | Extend the lease paths before staging |
-| Invalid/escaping path | `INVALID_PATH` | Use workspace-relative literal paths |
-| Caller-supplied `before` is stale | Not detected by core | Applier must compare disk content before writing |
-| External process edits a leased path | Not detected (no fs watch) | Applier verification + single-writer discipline |
-| DSH process restart | All leases/patchsets lost | Reacquire; future persistence layer |
-| Two DSH processes | Managers do not see each other | Future daemon/OS lock; MVP is single-process |
+| Invalid/escaping path | `INVALID_PATH` / `RESERVED_PATH` | Use workspace-relative literal paths away from `.dsh-os-lease` |
+| Symlink on a target path | `SYMLINK_NOT_ALLOWED` / `PATH_ESCAPE` | Use real directories; the applier refuses links even inside `root` |
+| Overlapping applies on one host | `LOCKED` from `fs.open('wx')` | Retry after the other apply finishes, or use disjoint paths |
+| Caller-supplied `before` is stale | Not detected by core; applier records `beforeMatches` and backs up the real pre-image | Enable `verifyBefore: true` to reject a mismatch |
+| External process edits a leased path | Not detected (no fs watch) | Applier locks only coordinate applies; use single-writer discipline |
+| Apply fails mid-patchset | Journal marks `applying` / `applyFailed`; recovery restores in reverse | Inspect/run `rollback(journal)`; journal is retained when recovery fails |
+| Rollback backup is missing | `ROLLBACK_FAILED` with per-path `BACKUP_MISSING` | Restore the journal backup, then retry rollback; it is idempotent |
+| DSH process restart | Leases/patchsets lost; journals and locks remain | Reacquire; use a fresh patchset id if an old journal id exists |
+| Two DSH processes | Managers do not see each other's leases; applier lock files still exclude same-path applies | Future daemon for shared lease state |
 | Case-insensitive filesystem | `src/A` and `src/a` are distinct | Future canonicalization by workspace filesystem |
 | Clock skew / injected clock | TTL decisions follow the injected clock | Tests inject deterministic clocks; production uses `Date.now()` |
-| Memory growth from large patchsets | Bodies retained until manager dies | Bound patchset size in the applier; status never echoes bodies |
+| Memory growth from large patchsets | Bodies retained until manager dies | No size bound yet; prefer small patchsets; status never echoes bodies |
 
 ## 7. Security and permissions
 
 The manager has no filesystem, process, network, or environment access. Its
-only authority is the DSH tool call. `owner` is a label, not an authenticated
-identity: any agent allowed to call the tools can release or renew any lease it
-can name. If multi-tenant isolation is required, an outer authorization layer
-must enforce agent-to-owner binding. Do not store secrets in `before`/`after`;
-they remain in memory and are visible to anyone who can query a live manager
-(though `workspace_status` omits bodies).
+only authority is the DSH tool call. The applier is a separate opt-in module:
+it reads and writes only under the configured canonical `root`, rejects symlinks
+on the target chain, and keeps pre-images in `.dsh-os-lease/`. `owner` is a
+label, not an authenticated identity: any agent allowed to call the tools can
+release or renew any lease it can name. If multi-tenant isolation is required,
+an outer authorization layer must enforce agent-to-owner binding. Do not store
+secrets in `before`/`after`; they remain in memory and are visible to anyone who
+can query a live manager (though `workspace_status` omits bodies). With the
+applier enabled, `before`/`after` bodies and on-disk pre-images are written to
+the journal/backups on disk, so protect `.dsh-os-lease/` accordingly.
 
 ## 8. 30-day roadmap
 
@@ -264,11 +281,13 @@ they remain in memory and are visible to anyone who can query a live manager
 - Stable, collision-resistant ids; manager restart tests; keep `node --test`
   offline.
 
-**Days 8–14 — real applier**
-- Add an opt-in applier that reads actual pre-images, verifies `before` at
-  write time, writes via temp file + rename, and records results.
-- Execute rollback, not just return pre-images.
-- Integrate with DSH edit/write intent; emit commit/rollback events for audit.
+**Days 8–14 — real applier (implemented in 0.1.2)**
+- Opt-in applier reads actual pre-images, optionally verifies `before` at write
+  time, writes via temp file + fsync + rename, and records results.
+- Journal-backed rollback restores/deletes in reverse order and is idempotent.
+- Per-path lock files exclude overlapping applies on the same host.
+- Remaining: integrate with DSH edit/write intent; emit commit/rollback events
+  for audit.
 
 **Days 15–21 — worktree and liveness**
 - Worktree lifecycle hooks (acquire on create, release on remove).

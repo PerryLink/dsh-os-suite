@@ -1,8 +1,14 @@
 # CI for dsh-os-suite.
 #
-# The suite supports Node ^22.19.0 || >=24.9.0, so both the lower bound and the
-# current Node 24 line are exercised. The repo has a committed package-lock.json,
-# hence `npm ci` (reproducible installs, cached by setup-node).
+# The suite supports Node ^22.19.0 || >=24.9.0. The test job exercises Node 24
+# on Linux, Windows and macOS, plus the Node 22 lower bound on Linux. The repo
+# has a committed package-lock.json, hence `npm ci` (reproducible installs,
+# cached by setup-node).
+#
+# `dsh-smoke` is the end-to-end packaging gate: it packs the six workspaces,
+# installs those tarballs into a throwaway DSH_HOME with a pinned DSH release,
+# and asserts the composed web profile still names every package. It runs on
+# Linux only and never reads or writes a real profile.
 name: CI
 
 on:
@@ -20,15 +26,17 @@ concurrency:
 
 jobs:
   test:
-    name: Node ${{ matrix.node }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    name: Test / Node ${{ matrix.node }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        node:
-          - '22.19.0'
-          - '24'
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: ['24']
+        include:
+          - os: ubuntu-latest
+            node: '22.19.0'
 
     steps:
       - uses: actions/checkout@v7
@@ -40,10 +48,34 @@ jobs:
           cache: npm
 
       - name: Install dependencies (npm ci)
-        run: npm ci --ignore-scripts --no-audit --no-fund
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund
 
       - name: Test
-        run: npm test
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm test
+
+      # Observation-only coverage: no threshold is enforced yet. Git Bash on
+      # Windows expands the glob, so the same command works on all three OSes.
+      - name: Coverage (Node 24, no threshold)
+        if: matrix.node == '24'
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test --experimental-test-coverage packages/dsh-os-*/test/*.test.js 2>&1 | tee coverage.txt
+
+      - name: Upload coverage report
+        if: always() && matrix.node == '24'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.os }}-node-${{ matrix.node }}
+          path: coverage.txt
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Syntax check every src/*.js
         shell: bash
@@ -93,4 +125,115 @@ jobs:
       # Runs `npm pack --dry-run --json` for every package and asserts the
       # required files (src/, README, DESIGN, LICENSE, package.json).
       - name: Pack manifest smoke test
-        run: node scripts/smoke-pack.mjs
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/smoke-pack.mjs
+
+  # End-to-end smoke against a pinned DSH release. Linux only: the profile tool
+  # forwards to pnpm and the paths are POSIX. It installs from local tarballs,
+  # so it exercises the publishable artifact without waiting for a release.
+  dsh-smoke:
+    name: DSH profile smoke (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      DSH_VERSION: '0.2.2-rc.3'
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+
+      # `dsh plugin` forwards to pnpm, which is not part of the runner image.
+      # Pin the version the local smoke was verified with.
+      - name: Install pnpm
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global pnpm@12.16.1
+          pnpm --version
+
+      - name: Create throwaway DSH_HOME
+        shell: bash
+        run: |
+          set -euo pipefail
+          smoke_dir="$RUNNER_TEMP/dsh-os-smoke"
+          mkdir -p "$smoke_dir/tarballs"
+          dsh_home="$(mktemp -d "$smoke_dir/home.XXXXXX")"
+          {
+            echo "SMOKE_DIR=$smoke_dir"
+            echo "DSH_HOME=$dsh_home"
+          } >> "$GITHUB_ENV"
+          echo "DSH_HOME=$dsh_home"
+
+      - name: npm pack the six packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          for dir in packages/dsh-os-*; do
+            ( cd "$dir" && npm pack --pack-destination "$SMOKE_DIR/tarballs" )
+          done
+          tarballs=("$SMOKE_DIR"/tarballs/*.tgz)
+          if [ "${#tarballs[@]}" -ne 6 ]; then
+            echo "::error::expected 6 tarballs, found ${#tarballs[@]}"
+            ls -l "$SMOKE_DIR/tarballs"
+            exit 1
+          fi
+          echo "packed ${#tarballs[@]} tarball(s)"
+
+      - name: Install the tarballs into the temp profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$SMOKE_DIR/plugin-add.log"
+          if ! npx --yes "@deepseek-ai/dsh@${DSH_VERSION}" plugin --profile web add "$SMOKE_DIR"/tarballs/*.tgz >"$log" 2>&1; then
+            echo "::error::dsh plugin add failed; log follows"
+            cat "$log"
+            exit 1
+          fi
+          cat "$log"
+
+      # Each installed bundle contributes one `# == <package-name>` section to
+      # the dump. Assert all six names and exactly six dsh-os-* sections.
+      - name: Assert the composed profile lists all six bundles
+        shell: bash
+        run: |
+          set -euo pipefail
+          dump="$SMOKE_DIR/dump-config.yml"
+          if ! npx --yes "@deepseek-ai/dsh@${DSH_VERSION}" --profile web --dump-config >"$dump" 2>"$SMOKE_DIR/dump-config.err"; then
+            echo "::error::dsh --dump-config failed; log follows"
+            cat "$SMOKE_DIR/dump-config.err"
+            exit 1
+          fi
+
+          missing=0
+          for pkg in dsh-os-catalog dsh-os-eval dsh-os-lease dsh-os-quota dsh-os-registry dsh-os-trace; do
+            if grep -qE "^# == ${pkg}(,|$)" "$dump"; then
+              echo "ok: # == ${pkg}"
+            else
+              echo "::error::missing '# == ${pkg}' in --dump-config"
+              missing=1
+            fi
+          done
+
+          count="$(grep -cE '^# == dsh-os-' "$dump" || true)"
+          echo "dsh-os-* layer sections: ${count}"
+          if [ "$missing" -ne 0 ] || [ "$count" -ne 6 ]; then
+            echo "::error::expected exactly six '# == dsh-os-*' sections; dump follows"
+            cat "$dump"
+            exit 1
+          fi
+
+      - name: Remove the throwaway DSH_HOME
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${DSH_HOME:-}" in
+            "$RUNNER_TEMP"/dsh-os-smoke/*) rm -rf -- "$DSH_HOME" ;;
+            *) echo "not removing DSH_HOME=${DSH_HOME:-<unset>}" ;;
+          esac

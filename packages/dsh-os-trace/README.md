@@ -7,7 +7,7 @@
 >
 > Causal audit and tamper-evident evidence bundles for DSH agent runs.
 
-**状态：0.1.2（MVP，已发布到 npm）。** 社区项目，非 DeepSeek 官方项目，Apache-2.0，无 SLA。
+**状态：源码在 0.2.0 基础上加入实时事件采集与 HMAC 签名（尚未发布到 npm；npm 上的 0.2.0 不含这些能力）。** 社区项目，非 DeepSeek 官方项目，Apache-2.0，无 SLA。
 
 ## 为什么
 
@@ -18,7 +18,7 @@ DSH 的 session 日志能回答「发生过什么」，但很难直接回答下�
 3. **审计时如何证明没被改过？** 导出一份 JSON 交给别人，对方无法判断某条记录是否被删改、重排或拼接。
 4. **分享时如何不泄露密钥？** `attrs` 里经常带 API key、token、请求头；直接导出等于泄密。
 
-`dsh-os-trace` 在**用户级**补这一层：以 span 为最小事件，沿 `parentId` 组成因果图；所有 span 进入一条 SHA-256 哈希链；导出时可按字段名递归脱敏并重新封链；校验时返回第一个坏掉的 span。它不替换 DSH 日志，也不采集 OTel；它是日志之上的一层**可解释 + 可验证**视图。
+`dsh-os-trace` 在**用户级**补这一层：默认订阅 DSH 的 tool / approval / agent / subagent / job / MCP / session 事件，以 span 为最小事件沿 `parentId` 组成因果图；结束的 span 进入一条 SHA-256 哈希链；导出时可按字段名递归脱敏并重新封链，也可用 HMAC-SHA256 签名；校验时返回第一个坏掉的 span。它不替换 DSH 日志，也不采集 OTel；它是日志之上的一层**可解释 + 可验证**视图。
 
 ## 安装
 
@@ -47,26 +47,48 @@ dsh --profile <your-profile> --dump-config   # 应出现 "# == dsh-os-trace" 层
 dsh plugin --profile <your-profile> remove dsh-os-trace
 ```
 
-### 数据从哪来（MVP）
+### 数据从哪来
 
-当前版本**不订阅实时 DSH 事件**，启动时支持两种只读输入：
+默认同时启用**实时采集**与两种只读种子输入：
 
 ```yaml
 # 在 profile / patch 叠加层的 dsh-os-trace 条目上传入（示意）
 - id: dsh-os-trace
   name: dsh-os-trace
   config:
+    ingest: true                              # 默认 true；false 只保留种子输入
     dataFile: /absolute/path/to/spans.jsonl   # 每行一个 span JSON
 ```
 
+- **实时采集（默认）**：`apply()` 时用 `ctx.on(...)` 订阅 DSH 事件，把事件映射为 span。设置 `ingest: false` 可关闭。
 - `dataFile`：启动时读取一次的 JSONL 快照；坏行会让插件加载失败，而不是静默丢数据。
 - `config.spans`：程序化注入的 span 数组，主要供嵌入和测试使用。
 
-实时采集适配器（`session.event` → span）尚未实现，路线见 [DESIGN.md](./DESIGN.md)。
+实时订阅的事件（具体名称随 DSH 版本而异，未知事件一律忽略、不抛错）：
 
-## 四个工具
+| 来源 | 映射结果 |
+|---|---|
+| `session/event` | `tool/call`、`tool/result`、`approval/asked`、`approval/decided`、`job/registered`、`job/settled`、`turn/*`、`step/*` → `tool` / `approval` / `job` / `session` span |
+| `tools/pre-execute`、`tools/post-execute` | 按 `callId` 配对的 tool 生命周期；工具名以 `mcp__` 开头时记作 `mcp` |
+| `tool/result`、`tools/result` | 直接观察到的工具结果（与 post-execute 去重） |
+| `approval/*` | `approval/request`、`approval/asked`、`approval/decided` 等 |
+| `agent/*` | `agent/created`、`agent/status`、`agent/error`、`agent/disposed` → `session` span |
+| `subagent/*` | `subagent/start` / `subagent/end` → `subagent` span |
+| `job/*` | `job/registered` / `job/settled` → `job` span |
+| `mcp/*` | MCP 生命周期事件 → `mcp` span；MCP 工具调用按 `mcp__<server>__<tool>` 命名识别 |
 
-所有工具只读内存 store，返回结构化 JSON；不会写文件、不会联网。工具参数由 DSH 在调用前校验。
+配对与去重规则：
+
+- tool 按 `callId` 配对 pre/post；approval 优先按 `id`/`callId`，二者都没有时才退回 `toolName`（同一工具的并发审批可能无法区分）；subagent 按 `runId`；job 按 `jobId`。
+- 重复投递按稳定 id 幂等：同一个结束事件不会产生第二条 span，也不会重复进入哈希链。
+- **只有结束事件才进入哈希链**。只有 start 没有 end 的调用保留在采集器的实时视图里，`status: "running"`，由 `trace_live_status` 计数；这是 append-only 链无法回改已写入 span 的直接结果。
+- 采集只记录结构化字段（id、工具名、状态、错误码等），**不记录工具参数、消息正文或自由文本原因**，避免证据包静默变成密钥/隐私收集器。
+
+Cordis 事件总线没有通配符派发：本包会把 `approval/*` 等模式名注册给支持通配符的宿主，同时枚举当前 DSH 的已知具体事件名，并用 `internal/dispatch` 作为未知家族事件的最佳努力兜底。
+
+## 五个工具
+
+所有工具只读内存 store 与采集器状态，返回结构化 JSON；不会写文件、不会联网。工具参数由 DSH 在调用前校验。
 
 ### `trace_query`
 
@@ -78,7 +100,7 @@ dsh plugin --profile <your-profile> remove dsh-os-trace
 | `sessionId` | 否 | 精确 DSH session id |
 | `parentId` | 否 | 精确父 span id |
 | `agentPath` | 否 | 精确 agent path |
-| `kind` | 否 | 单个事件类别：`tool` / `subagent` / `job` / `approval` / `mcp` / `workflow` |
+| `kind` | 否 | 单个事件类别：`tool` / `subagent` / `job` / `approval` / `mcp` / `session` / `workflow` |
 | `status` | 否 | 单个状态：`ok` / `error` / `running` |
 | `name` | 否 | 精确操作名 |
 | `since` / `until` | 否 | 按 `startMs` 过滤（含边界） |
@@ -122,13 +144,15 @@ dsh plugin --profile <your-profile> remove dsh-os-trace
 | 参数 | 必填 | 说明 |
 |---|---|---|
 | `redact` | 否 | 要递归替换的对象字段名数组，大小写不敏感，例如 `["apiKey","token"]` |
+| `sign` | 否 | `true` 时给 bundle 附加 HMAC-SHA256 签名；密钥取 `config.secret` 或 `TESTATUM_KEY` |
 
-返回 bundle：`format`、`version`、`hashAlgo`、`exportedAt`、`spanCount`、`rootHash`、`sourceRootHash`、`genesisPrevHash`、`redaction`、`spans`。
+返回 bundle：`format`、`version`、`hashAlgo`、`exportedAt`、`spanCount`、`rootHash`、`sourceRootHash`、`genesisPrevHash`、`redaction`、`spans`；`sign: true` 时另有 `signature: { alg: "hmac-sha256", sig }`。
 
 - 不传 `redact`：保留 store 中的原始哈希链，`rootHash === sourceRootHash`。
 - 传 `redact`：所有匹配字段（任意层级、含数组内元素）替换为字符串 `"[redacted]"`，然后**重新计算整条链**，让校验针对脱敏后的字节。`sourceRootHash` 记录脱敏前的链尾哈希，但它只是元数据，不能代替原 bundle 的密码学证明。
 - 脱敏只按**字段名**匹配，不扫描字符串内容。把 key 放在 `attrs` 的任意嵌套对象里都能命中；拼在普通字符串里则不会。
-- **不要 redact span 的结构字段**（`id`、`parentId`、`kind`、`status`、`startMs`、`attrs` 等）。它们被替换成字符串会破坏类型/因果引用；敏感信息应放在 `attrs` 的键里。0.1.0 没有结构字段保留规则，调用方需自行避免。
+- **不要 redact span 的结构字段**（`id`、`parentId`、`kind`、`status`、`startMs`、`attrs` 等）。它们被替换成字符串会破坏类型/因果引用；敏感信息应放在 `attrs` 的键里。当前版本没有结构字段保留规则，调用方需自行避免。
+- `sign: true` 时，签名覆盖脱敏后的完整 bundle（含 `signature` 之外的元数据）。密钥缺失会返回 `SIGNING_KEY_MISSING`，错误信息与工具输出都不会包含密钥值。建议用环境变量而不是 `config.secret`，因为 `--dump-config` 可能打印 profile 配置。
 
 ### `trace_verify`
 
@@ -143,7 +167,36 @@ dsh plugin --profile <your-profile> remove dsh-os-trace
 - `ok: true`：每条 span 的 `prevHash` 与前一条的 `hash` 一致，每条 `hash` 重算一致，`rootHash` 与链尾一致。
 - `ok: false`：`firstBad = { index, id, reason, expected?, actual? }`。`index` 从 0 开始；`-1` 表示 bundle 级问题（格式、版本、`spans` 不是数组、`spanCount` 不符）。失败时顶层 `rootHash` 为 `null`，计算出的链尾哈希在 `firstBad.expected` 里（如果是哈希/根不匹配）。
 - 能发现：改字段、改 `hash`、重排 span、删掉尾部但没同步 `rootHash`/`spanCount`、把一条链嫁接到另一条链、坏 JSON 结构。
-- **不能发现**：攻击者拿到整个 bundle 后重算全部哈希并重写 `rootHash`；这不是签名，也没有外部锚（见「限制」）。
+- **不能发现**：攻击者拿到整个 bundle 后重算全部哈希并重写 `rootHash`。`trace_verify` 只校验哈希链，不校验 HMAC；要验签请在代码中调用本包导出的 `verifySignedBundle(signed, secret)`（缺省读 `TESTATUM_KEY`）。HMAC 也不是身份凭证或透明日志（见「限制」）。
+
+### `trace_live_status`
+
+无参数。返回实时采集器的状态，不返回 span 内容或密钥：
+
+```json
+{
+  "attached": true,
+  "subscriptions": 36,
+  "subscribed": ["session/event", "tools/pre-execute", "..."],
+  "wildcard": true,
+  "events": 12,
+  "mapped": 10,
+  "ignored": 2,
+  "errors": 0,
+  "finalized": 8,
+  "running": 2,
+  "failed": 0,
+  "lastEventAt": 1700000000000,
+  "lastError": null,
+  "eventsByName": [{ "name": "tools/pre-execute", "count": 4 }]
+}
+```
+
+- `attached`：是否成功安装事件钩子（`ctx.on` 不可用时为 `false`，插件仍可只用种子输入）。
+- `running`：只有 start、还没等到 end 的 span；它们**不在**哈希链里。
+- `finalized`：已 ingest 进 store 的结束 span；`failed`：被 store 拒绝的终态 span（例如 id 冲突）。
+- `ignored`：未知或无法映射的事件；`errors`：采集器内部错误，永远不会抛给 agent 主循环。
+- `wildcard`：是否成功安装 `internal/dispatch` 家族兜底钩子。
 
 ## 证据格式
 
@@ -159,24 +212,42 @@ hash    = sha256(prevHash + payload)
 - 链的顺序是 **ingest 顺序**，不是 `startMs` 顺序。一个 store 只有一条全局链，跨 session 交错也按实际接入顺序串起来。
 - `spanCount`、`rootHash`、`format`、`version`、`genesisPrevHash` 会被校验；`exportedAt`、`sourceRootHash`、`hashAlgo`、`redaction` 目前是**未封链的元数据**，不要把它们当作独立证据。
 
+### 签名（`sign: true`）
+
+`trace_export({ sign: true })` 会在 bundle 上加一个 `signature` 字段：
+
+```text
+payload = canonicalJson(bundle 去掉 signature 字段)
+sig     = HMAC-SHA256(secret, payload)      # 64 位小写十六进制
+signature = { "alg": "hmac-sha256", "sig": sig }
+```
+
+- 这与 `testatum-attest` v1 的 `signaturePayload()` 约定一致：对象 key 递归排序、无多余空白、不把 `signature` 自身纳入载荷。带 `schema: "testatum/v1"` 的对象可用同一套 `signBundle` / `verifySignedBundle` 处理。
+- 密钥来自 `config.secret`，否则 `TESTATUM_KEY`；密钥不会出现在工具输出、bundle、错误信息或日志中。
+- `verifySignedBundle(signed)` 缺省从 `TESTATUM_KEY` 取密钥；也可显式传第二参数。校验失败返回 `{ ok: false, reason }`（`signature-missing` / `signature-malformed` / `signature-mismatch` / `secret-missing` 等），不会抛错。
+- 签名覆盖除 `signature` 外的**全部**字段，包括 `exportedAt` 和脱敏元数据；因此改任何字段都会让签名失配。但 HMAC 仍是共享密钥 MAC，不是透明日志，也不证明签发者身份。
+
 ## 权限与数据
 
-- **只读会话数据。** 设计上只消费会话事件；当前 MVP 只读取启动时配置的本地 JSONL（`dataFile`）或 `config.spans`，不修改、不删除任何 session 数据。
+- **只读会话数据。** 实时采集只订阅 DSH 事件总线（含 `internal/dispatch` 家族兜底观察钩子），不修改、不删除任何 session 数据；种子输入只读取 `dataFile` 或 `config.spans`。
 - **不写文件。** store 是进程内 Map；`trace_export` 只返回对象，不落盘。DSH 退出即丢失，除非调用方自己保存返回的 JSON。
-- **不联网、不启子进程、不读凭据。** 没有 HTTP 客户端、shell、进程管理或密钥读取。唯一接触文件系统的地方是启动时读取 `dataFile`。
-- **无鉴权。** 能调用这四个工具的 agent 就能读取 store 里的全部 span；工具层权限由 DSH 的 tool policy 负责，本包不额外区分租户。
-- **数据字段**：session id、agent path、事件名、起止时间、状态、调用方提供的 `attrs`、哈希。`attrs` 完全由上游决定，可能含敏感信息；导出前请显式传 `redact`。
-- **SQLite 尚未实现。** 规划中的本地持久化形态是只读会话事件 → JSONL 追加 / SQLite；0.1.0 两者都没有写入路径。
+- **不联网、不启子进程。** 没有 HTTP 客户端、shell 或进程管理。唯一接触文件系统的地方是启动时读取 `dataFile`。
+- **只在签名时读一个密钥。** `trace_export sign:true` 从 `config.secret` 或 `TESTATUM_KEY` 读取 HMAC 密钥；不落盘、不打印、不写入 bundle 或错误信息。不做身份验证、不读取其他凭据。
+- **无鉴权。** 能调用这五个工具的 agent 就能读取 store 里的全部 span；工具层权限由 DSH 的 tool policy 负责，本包不额外区分租户。
+- **数据字段**：session id、agent path、事件名、起止时间、状态、结构化 `attrs`、哈希。实时采集不抓工具参数/消息正文；调用方注入的 `attrs` 可能含敏感信息，导出前请显式传 `redact`。
+- **SQLite 尚未实现。** 规划中的本地持久化形态是只读会话事件 → JSONL 追加 / SQLite；当前两者都没有写入路径。
 
 ## 限制
 
-- **MVP 不接真实 OTel。** 没有 OTLP exporter/importer，不支持 W3C trace context、span id 传播或 OpenTelemetry SDK 互操作。当前格式是本包自己的 v1 bundle。
-- **没有实时采集。** `session.event`、tool call、approval、subagent、job、MCP、workflow 的自动映射都未接线；需要外部把 span 写进 JSONL 或 `config.spans`。因此这四个工具当前更像「审计/证据层」，不是「记录器」。
-- **哈希链不是签名。** 没有 Ed25519/RSA 签名，没有外部锚（Git commit、透明日志、时间戳服务）。能重写整条链并重算 `rootHash` 的人可以伪造一份自洽的 bundle；`verify` 只能证明「这份 bundle 内部自洽」，不能证明「它来自某个特定 DSH run」。
-- **元数据未封链。** 见「证据格式」最后一条。
+- **仍不接 OTel / OTLP。** 没有 OTLP exporter/importer，不支持 W3C trace context 或 OpenTelemetry SDK 互操作。实时采集接的是 DSH 自己的事件总线，不是 OTel；导出的仍是本包自己的 v1 bundle。
+- **实时采集是尽力而为。** Cordis 没有通配符事件派发，本包枚举当前 DSH 的已知事件名，并用 `internal/dispatch` 兜底；DSH 改事件名或字段后，未知事件会被忽略，不会伪造 span。MCP 生命周期事件目前只在产生方发事件时才可见；MCP 工具调用主要按 `mcp__` 名称前缀识别。采集器只有 attach 之后的内存态，不回放历史 session，重启即空。
+- **运行中的 span 不进哈希链。** 只有配对到结束事件的 span 才被 ingest；长时间不结束的 job/tool 只在 `trace_live_status` 里以 `running` 计数，不会出现在 `trace_export` 中。链顺序是**结束/ingest 顺序**，不是开始时间顺序。
+- **HMAC 不是透明日志。** 哈希链本身仍只是自洽性校验；`sign: true` 加的是共享密钥 HMAC-SHA256，不是 Ed25519/RSA 公钥签名，没有外部锚（Git commit、透明日志、时间戳服务）。持有同一密钥的人都能签发；它能证明「知道密钥的人签过这份 bundle」，不能证明签发者身份，也不能证明「它来自某个特定 DSH run」。签名格式与 `testatum-attest` v1 的 `signaturePayload`（canonical JSON 去掉 `signature`）兼容，`schema: "testatum/v1"` 可作为普通已签名对象接受，但这只是格式兼容，不是完整 trust card 语义。
+- **元数据未封链（未签名时）。** 未签名 bundle 的 `exportedAt` 等元数据不在哈希链里；签名 bundle 的 HMAC 覆盖除 `signature` 外的全部字段，包括元数据。见「证据格式」。
 - **脱敏不是秘密扫描。** 只按字段名精确匹配（大小写不敏感），不识别值里的 `sk-...`、JWT、私钥；也不会脱敏字段名本身。
 - **脱敏后重新封链意味着不能拿它和原始 bundle 比哈希。** 如需最强证据，保留未脱敏原件，用脱敏副本对外分享。
 - **单进程、内存态、无并发控制。** 多个 DSH 进程各自一条链；重启即空；没有锁、没有 fsync、没有崩溃恢复。
+- **采集器没有 retention / 采样。** 结束的 span 和等待配对的 running 记录都留在进程内，长时间运行会持续增长；没有上限、环形缓冲或淘汰策略。
 - **查询是全量线性扫描。** 没有索引、分页游标或跨 store 合并；`limit` 只截断结果，不减少扫描成本。
 - **时间来自调用方。** 没有时钟校准或单调性校验；`startMs` 可早于父节点，也可乱序。哈希链顺序与时间顺序是两件事。
 - **canonical JSON 不是 RFC 8785。** 只保证本包导出的 bundle 在本包内可复现；跨实现需要对齐同一算法。
@@ -199,7 +270,7 @@ node --test packages/dsh-os-trace/test/*.test.js
 node --check packages/dsh-os-trace/src/*.js
 ```
 
-`src/core.js` 不 import 任何 `@deepseek-ai/*`，可离线单测；插件入口只负责创建 store、注册四个工具和读取只读 JSONL。
+`src/core.js` 不 import 任何 `@deepseek-ai/*`，可离线单测；`src/ingest.js` / `src/sign.js` 也不依赖 DSH 运行时。插件入口负责创建 store、装载种子输入、注册五个工具、按 `config.ingest !== false` 附加实时采集器。
 
 ## 许可
 

@@ -1,12 +1,13 @@
 {
   "name": "dsh-os-eval",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Regression eval gates for DSH agents: case definitions, baseline comparison and CI verdicts.",
   "type": "module",
   "license": "Apache-2.0",
   "main": "src/index.js",
   "exports": {
-    ".": "./src/index.js"
+    ".": "./src/index.js",
+    "./session": "./src/session.js"
   },
   "files": [
     "src",

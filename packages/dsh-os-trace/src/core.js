@@ -30,6 +30,7 @@ export const SPAN_KINDS = Object.freeze([
   'job',
   'approval',
   'mcp',
+  'session',
   'workflow',
 ])
 
@@ -37,7 +38,7 @@ export const SPAN_KINDS = Object.freeze([
 export const SPAN_STATUSES = Object.freeze(['ok', 'error', 'running'])
 
 /**
- * @typedef {'tool'|'subagent'|'job'|'approval'|'mcp'|'workflow'} SpanKind
+ * @typedef {'tool'|'subagent'|'job'|'approval'|'mcp'|'session'|'workflow'} SpanKind
  * @typedef {'ok'|'error'|'running'} SpanStatus
  */
 

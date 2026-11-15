@@ -9,6 +9,17 @@ import {
   createTraceStore,
   verifyBundle,
 } from './core.js'
+import { createIngest } from './ingest.js'
+import { signBundle } from './sign.js'
+
+export { createIngest } from './ingest.js'
+export {
+  SECRET_ENV,
+  SIGN_ALG,
+  signBundle,
+  signaturePayload,
+  verifySignedBundle,
+} from './sign.js'
 
 export const name = 'dsh-os-trace'
 export const inject = ['tools']
@@ -17,7 +28,11 @@ export const inject = ['tools']
  * @typedef {object} TracePluginConfig
  * @property {string} [dataFile] Read-only JSONL file loaded once when the plugin starts.
  * @property {object[]} [spans] Programmatic seed spans, mainly for embedding and tests.
- * @property {() => number} [now] Clock override used for `exportedAt`.
+ * @property {() => number} [now] Clock override used for `exportedAt` and live spans.
+ * @property {boolean} [ingest] Attach the live DSH event collector; defaults to true.
+ * @property {string|Uint8Array} [secret] HMAC secret for `trace_export({sign:true})`.
+ *   Prefer the `TESTATUM_KEY` environment variable so the secret does not enter
+ *   a dumped profile config. The value is never logged or returned.
  */
 
 const spanSchema = {
@@ -123,6 +138,16 @@ const whyOutputSchema = {
   },
 }
 
+const signatureSchema = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    alg: { type: 'string', required: true, enum: ['hmac-sha256'] },
+    sig: { type: 'string', required: true, description: 'Lower-case hex HMAC-SHA256' },
+    keyId: { type: 'string', description: 'Optional signer key label' },
+  },
+}
+
 const bundleOutputSchema = {
   type: 'object',
   additionalProperties: false,
@@ -145,6 +170,47 @@ const bundleOutputSchema = {
       },
     },
     spans: { type: 'array', required: true, items: spanSchema },
+    signature: signatureSchema,
+  },
+}
+
+const liveStatusOutputSchema = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    attached: { type: 'boolean', required: true, description: 'Whether live event hooks are installed' },
+    subscriptions: { type: 'integer', required: true, description: 'Registered event hooks' },
+    subscribed: { type: 'array', required: true, items: { type: 'string' } },
+    wildcard: { type: 'boolean', required: true, description: 'Whether the internal/dispatch catch-all is installed' },
+    events: { type: 'integer', required: true, description: 'Event deliveries observed' },
+    mapped: { type: 'integer', required: true, description: 'Deliveries mapped to a span' },
+    ignored: { type: 'integer', required: true, description: 'Deliveries ignored as unknown/unmappable' },
+    errors: { type: 'integer', required: true, description: 'Collector errors contained' },
+    finalized: { type: 'integer', required: true, description: 'Terminal spans ingested into the store' },
+    running: { type: 'integer', required: true, description: 'Pending start events without an end' },
+    failed: { type: 'integer', required: true, description: 'Terminal spans rejected by the store' },
+    lastEventAt: {
+      oneOf: [{ type: 'null' }, { type: 'number' }],
+      required: true,
+      description: 'Collector clock at the last delivery',
+    },
+    lastError: {
+      oneOf: [{ type: 'null' }, { type: 'string' }],
+      required: true,
+      description: 'Last contained collector error, without payload data',
+    },
+    eventsByName: {
+      type: 'array',
+      required: true,
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          name: { type: 'string', required: true },
+          count: { type: 'integer', required: true },
+        },
+      },
+    },
   },
 }
 
@@ -226,8 +292,24 @@ export function apply(ctx, config = {}) {
   if (typeof config !== 'object' || Array.isArray(config)) {
     throw new TraceError('INVALID_OPTIONS', 'dsh-os-trace config must be an object')
   }
+  if (config.ingest !== undefined && typeof config.ingest !== 'boolean') {
+    throw new TraceError('INVALID_OPTIONS', 'dsh-os-trace config.ingest must be a boolean')
+  }
+  if (config.secret !== undefined) {
+    const validSecret =
+      (typeof config.secret === 'string' && config.secret.trim().length > 0) ||
+      (config.secret instanceof Uint8Array && config.secret.length > 0)
+    if (!validSecret) {
+      throw new TraceError(
+        'INVALID_OPTIONS',
+        'dsh-os-trace config.secret must be a non-empty string or Uint8Array',
+      )
+    }
+  }
 
   const store = createTraceStore(config.now === undefined ? {} : { now: config.now })
+  const ingest = createIngest(config.now === undefined ? { store } : { store, now: config.now })
+  const configuredSecret = config.secret
 
   if (config.spans !== undefined) {
     if (!Array.isArray(config.spans)) {
@@ -315,12 +397,16 @@ export function apply(ctx, config = {}) {
     defineTool({
       name: 'trace_export',
       description:
-        'Export the in-memory trace store as a SHA-256 hash-chain evidence bundle. An unredacted export preserves the store hashes; a redacted export recursively replaces matching object keys with "[redacted]" and re-seals the chain, so its hashes attest the redacted bundle rather than the original bytes.',
+        'Export the in-memory trace store as a SHA-256 hash-chain evidence bundle. An unredacted export preserves the store hashes; a redacted export recursively replaces matching object keys with "[redacted]" and re-seals the chain, so its hashes attest the redacted bundle rather than the original bytes. With sign: true, appends an HMAC-SHA256 signature over the canonical bundle (secret from config.secret or TESTATUM_KEY; the secret is never printed).',
       parameters: {
         redact: {
           type: 'array',
           items: { type: 'string' },
           description: 'Object keys to replace recursively, case-insensitive, for example ["apiKey","token"]',
+        },
+        sign: {
+          type: 'boolean',
+          description: 'Attach an HMAC-SHA256 signature using config.secret or TESTATUM_KEY',
         },
       },
       output: {
@@ -328,7 +414,24 @@ export function apply(ctx, config = {}) {
         render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
       },
       async execute(args) {
-        return store.exportBundle(args.redact === undefined ? {} : { redact: args.redact })
+        const bundle = store.exportBundle(
+          args.redact === undefined ? {} : { redact: args.redact },
+        )
+        if (args.sign !== true) return bundle
+        const secret =
+          configuredSecret !== undefined
+            ? configuredSecret
+            : typeof process.env.TESTATUM_KEY === 'string' &&
+                process.env.TESTATUM_KEY.trim().length > 0
+              ? process.env.TESTATUM_KEY
+              : undefined
+        if (secret === undefined) {
+          throw new TraceError(
+            'SIGNING_KEY_MISSING',
+            'trace_export sign:true requires config.secret or the TESTATUM_KEY environment variable',
+          )
+        }
+        return { ...bundle, signature: signBundle(bundle, secret) }
       },
     }),
   )
@@ -375,4 +478,24 @@ export function apply(ctx, config = {}) {
       },
     }),
   )
+
+  ctx.tools.register(
+    defineTool({
+      name: 'trace_live_status',
+      description:
+        'Report the live DSH event collector attached to this plugin: whether hooks are installed, how many events were observed/mapped/ignored, how many spans are running versus finalized, and the last contained error. Counts only; it does not return spans or secrets.',
+      parameters: {},
+      output: {
+        schema: liveStatusOutputSchema,
+        render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+      },
+      async execute() {
+        return ingest.status()
+      },
+    }),
+  )
+
+  if (config.ingest !== false) {
+    ingest.attach(ctx)
+  }
 }
