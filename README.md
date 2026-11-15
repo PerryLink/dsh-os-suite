@@ -26,9 +26,11 @@ DSH already has the organs of an agent OS — sessions, tools, agent loop, sandb
 ## Status (2026-11-15)
 
 - **276/276 tests pass** (`npm test`; six packages).
+- **Host-service integration**: four tests mount the real DSH `0.2.2-rc.3` service packages (Cordis Context, ToolRuntime, NativeToolExecutor, SessionStore, SessionQuery) and verify quota denial, trace spans, and eval live reads; run `npm run test:integration`.
+- **Coverage gate**: lines 85% / functions 80% / branches 70% (`npm run test:coverage`).
 - **21 tools** register through `defineTool`; all six entries import and `apply()` under a fake Cordis context.
 - **Names verified**: `npm view <name>` → E404; GitHub exact-name search → 0 (2026-11-15). See [NAME-CHECK.md](NAME-CHECK.md).
-- **Pre-release audit**: [AUDIT.md](AUDIT.md); three findings fixed (Apache-2.0 LICENSE, description accuracy, read-only `quota_status`).
+- **Pre-release audit**: [AUDIT.md](AUDIT.md) (historical, 0.1.x); the three findings were fixed in 0.2.x.
 - **Real install verified** in an isolated `DSH_HOME`: all six tarballs install via `dsh plugin --profile web add`, and `--dump-config` lists all six entries.
 - **Published**: all six packages at `0.2.4` on npm (2026-11-15).
 

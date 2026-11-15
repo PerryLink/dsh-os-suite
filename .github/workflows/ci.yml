@@ -39,10 +39,10 @@ jobs:
             node: '22.19.0'
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Node.js ${{ matrix.node }}
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: ${{ matrix.node }}
           cache: npm
@@ -53,24 +53,31 @@ jobs:
           set -euo pipefail
           npm ci --ignore-scripts --no-audit --no-fund
 
+      - name: Check documentation state
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run check:docs
+
       - name: Test
         shell: bash
         run: |
           set -euo pipefail
           npm test
 
-      # Observation-only coverage: no threshold is enforced yet. Git Bash on
-      # Windows expands the glob, so the same command works on all three OSes.
-      - name: Coverage (Node 24, no threshold)
-        if: matrix.node == '24'
+      # Coverage gate: run once on Linux so the three-OS matrix is not
+      # re-running the same suite three times. The thresholds are the observed
+      # floor with headroom (2026-11-15: lines 89.3 / funcs 89.4 / branches 77.4).
+      - name: Coverage gate (Node 24, ubuntu)
+        if: matrix.os == 'ubuntu-latest' && matrix.node == '24'
         shell: bash
         run: |
           set -euo pipefail
-          node --test --experimental-test-coverage packages/dsh-os-*/test/*.test.js 2>&1 | tee coverage.txt
+          npm run test:coverage 2>&1 | tee coverage.txt
 
       - name: Upload coverage report
-        if: always() && matrix.node == '24'
-        uses: actions/upload-artifact@v4
+        if: always() && matrix.os == 'ubuntu-latest' && matrix.node == '24'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: coverage-${{ matrix.os }}-node-${{ matrix.node }}
           path: coverage.txt
@@ -130,6 +137,34 @@ jobs:
           set -euo pipefail
           node scripts/smoke-pack.mjs
 
+  # Mounts the real DSH 0.2.2-rc.3 service packages (Cordis, ToolRuntime,
+  # NativeToolExecutor, SessionStore, SessionQuery) and checks the package
+  # seams against them. No model call and no API key are involved.
+  host-integration:
+    name: Host services integration (Linux, Node 24)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install dependencies (npm ci)
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Run real DSH service integration tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run test:integration
+
   # End-to-end smoke against a pinned DSH release. Linux only: the profile tool
   # forwards to pnpm and the paths are POSIX. It installs from local tarballs,
   # so it exercises the publishable artifact without waiting for a release.
@@ -140,10 +175,10 @@ jobs:
     env:
       DSH_VERSION: '0.2.2-rc.3'
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Node.js 24
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: '24'
           cache: npm

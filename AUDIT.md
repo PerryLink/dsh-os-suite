@@ -1,5 +1,8 @@
 # dsh-os-suite 发布前审计（AUDIT）
 
+> **Historical (2026-11-14, 0.1.x era):** retained for traceability. It is superseded by the `0.2.4` release; see `CHANGELOG.md` and the README status block for current state.
+
+
 - **审计对象**：`packages/dsh-os-{trace,lease,quota,eval,catalog,registry}` 六个包（`packages/_template` 不属发布对象）。
 - **审计时间**：2026-11-14 17:23–17:30（+08）。
 - **环境**：Node `v24.22.1`，npm `11.19.1`，Linux/WSL；DSH checkout `0.2.2-rc.3`。

@@ -7,7 +7,7 @@ Please read [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) and [SECURITY.md](SECURITY.
 ## Where the source lives: `04-build` and GitHub
 
 - The public repository is <https://github.com/PerryLink/dsh-os-suite>. It is the collaboration surface, the public source of record, and the home of release tags.
-- The maintainer workspace keeps the release staging tree at `04-build/dsh-os-suite` in the `deepseek-community-hub` workspace. That tree is a standalone Git checkout with a GitHub remote. Release candidates are built, tested, packed, and reviewed there.
+- The maintainer workspace keeps the release staging tree at `04-build/dsh-os-suite` in the `deepseek-community-hub` workspace. Treat GitHub as the source of record: the staging tree's bundled `.git` is a stale 0.1.1 checkout, so do not commit or push from it. Sync the staging tree from GitHub before editing, and use the GitHub API or a fresh clone to publish changes.
 - **Tracked files must not diverge.** Maintainers sync `04-build` → GitHub before tagging and publishing, and port an accepted pull request back into `04-build` after merging. Never make a long-lived GitHub-only edit.
 - External contributors do **not** need access to `04-build`. Open a pull request on GitHub; maintainers will apply the accepted change to the staging tree and re-sync.
 - `node_modules/`, `*.tgz`, `.DSH_HOME/`, and `*.log` are ignored. Do not commit them.

@@ -4,12 +4,12 @@
 
 ## Supported versions
 
-Security fixes are issued for the latest published `0.1.x` release only. The six packages are released in lockstep, so they share one version.
+Security fixes are issued for the latest published `0.2.x` release only. The six packages are released in lockstep, so they share one version.
 
 | Version | Supported |
 | --- | --- |
-| `0.1.1` (current) | Yes |
-| `0.1.0` and earlier | No |
+| `0.2.4` (current) | Yes |
+| `0.2.3` and earlier | No |
 
 Unsupported versions should be upgraded before reporting. There are no backport branches.
 
