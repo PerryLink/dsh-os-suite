@@ -17,9 +17,13 @@
  * - Each file is written to a sibling temporary file, fsynced, then renamed
  *   over the target. A failure mid-apply triggers a best-effort restore of the
  *   entries already journaled.
- * - Concurrent applies that touch the same normalized path are excluded with
- *   `fs.open(path, 'wx')` lock files. Locks are local to one filesystem host;
- *   they are not distributed locks.
+ * - Concurrent applies that touch the same normalized path are excluded by a
+ *   pluggable {@link LockProvider}. The default is a `FileLockProvider` over
+ *   `<root>/.dsh-os-lease/locks`, which uses `fs.open(path, 'wx')` lock files
+ *   containing `owner`/`expiresAt`, and reclaims expired records. Pass a
+ *   custom provider (Redis, SQL, a lock daemon, ...) with `lockProvider` for
+ *   other coordination semantics. These are time-based locks, not strong
+ *   distributed locks; see `docs/cross-host-locks.md`.
  *
  * The journal lives at `<root>/.dsh-os-lease/journal/<id>/journal.json`, with
  * pre-images in `<root>/.dsh-os-lease/journal/<id>/backups/`. The manifest
@@ -30,6 +34,12 @@ import { createHash, randomBytes } from 'node:crypto'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { normalizePath } from './core.js'
+import {
+  DEFAULT_LOCK_TTL_MS,
+  FileLockProvider,
+  LockError,
+  assertLockProvider,
+} from './lock.js'
 
 export const STATE_DIRNAME = '.dsh-os-lease'
 export const JOURNAL_DIRNAME = 'journal'
@@ -89,11 +99,6 @@ function messageOf(error) {
 /** @param {string | Buffer | Uint8Array} data */
 function hashBytes(data) {
   return createHash('sha256').update(data).digest('hex')
-}
-
-/** @param {string} relativePath */
-function lockFileName(relativePath) {
-  return `${hashBytes(Buffer.from(relativePath, 'utf8'))}.lock`
 }
 
 /**
@@ -167,7 +172,7 @@ async function resolveRoot(value) {
 
 /**
  * @param {unknown} options
- * @returns {{ root: string, verifyBefore: boolean }}
+ * @returns {{ root: string, verifyBefore: boolean, lockProvider: object | undefined, lockTtlMs: number, lockOwner: string }}
  */
 function normalizeApplyOptions(options) {
   if (options === null || typeof options !== 'object' || Array.isArray(options)) {
@@ -182,7 +187,60 @@ function normalizeApplyOptions(options) {
       'apply options.verifyBefore must be a boolean when present',
     )
   }
-  return { root: options.root, verifyBefore: options.verifyBefore === true }
+  let lockProvider
+  if (options.lockProvider !== undefined) {
+    try {
+      lockProvider = assertLockProvider(options.lockProvider)
+    } catch (error) {
+      throw new ApplyError(
+        APPLY_ERROR_CODES.INVALID_ARGUMENT,
+        `apply options.lockProvider is invalid: ${messageOf(error)}`,
+        { cause: error instanceof LockError ? error.code : undefined },
+      )
+    }
+  }
+  let lockTtlMs = DEFAULT_LOCK_TTL_MS
+  if (options.lockTtlMs !== undefined) {
+    if (
+      typeof options.lockTtlMs !== 'number' ||
+      !Number.isFinite(options.lockTtlMs) ||
+      options.lockTtlMs <= 0
+    ) {
+      throw new ApplyError(
+        APPLY_ERROR_CODES.INVALID_ARGUMENT,
+        'apply options.lockTtlMs must be a positive finite number',
+      )
+    }
+    lockTtlMs = Math.floor(options.lockTtlMs)
+    if (lockTtlMs < 1) {
+      throw new ApplyError(
+        APPLY_ERROR_CODES.INVALID_ARGUMENT,
+        'apply options.lockTtlMs must be at least 1 millisecond',
+      )
+    }
+  }
+  let lockOwner = `apply:${process.pid}`
+  if (options.lockOwner !== undefined) {
+    if (
+      typeof options.lockOwner !== 'string' ||
+      options.lockOwner.trim() === '' ||
+      options.lockOwner.length > 256 ||
+      /[\u0000-\u001f\u007f]/.test(options.lockOwner)
+    ) {
+      throw new ApplyError(
+        APPLY_ERROR_CODES.INVALID_ARGUMENT,
+        'apply options.lockOwner must be a 1-256 character string without control characters',
+      )
+    }
+    lockOwner = options.lockOwner
+  }
+  return {
+    root: options.root,
+    verifyBefore: options.verifyBefore === true,
+    lockProvider,
+    lockTtlMs,
+    lockOwner,
+  }
 }
 
 /**
@@ -996,82 +1054,111 @@ function rollbackResult(manifest, journalPath, root, alreadyRolledBack) {
 }
 
 /**
- * @param {Map<string, { path: string, lockPath: string }>} acquired
+ * Release acquired handles in reverse order. Release failures are ignored:
+ * the lock's TTL is the last-resort cleanup path, and a successful apply must
+ * not be reported as failed because a release raced with an expired reclaim.
+ *
+ * @param {{ release: (handle: any) => Promise<unknown> }} provider
+ * @param {any[]} handles
  */
-async function releaseLocks(acquired) {
-  for (const lock of [...acquired.values()].reverse()) {
+async function releasePathLocks(provider, handles) {
+  for (const handle of [...handles].reverse()) {
     try {
-      await fs.unlink(lock.lockPath)
+      await provider.release(handle)
     } catch {
-      // Best effort. A stale lock is reported by the next apply.
+      // Best effort. An expired lock is reclaimed by the next acquire.
     }
   }
 }
 
 /**
- * @param {string} stateDir
- * @param {string[]} normalizedPaths
+ * Map a provider `LOCKED` into the applier's stable error vocabulary while
+ * preserving the holder identity (`owner`, `expiresAt`) the caller needs to
+ * decide whether to wait, pick other paths, or clear a stale lock.
+ *
+ * @param {unknown} error
+ * @param {string} key
  */
-async function acquirePathLocks(stateDir, normalizedPaths) {
-  const lockDir = await ensureDirectory(path.join(stateDir, LOCK_DIRNAME), {
-    mode: 0o700,
-    label: 'lock directory',
-  })
+function toApplyLockError(error, key) {
+  // Custom providers need not import LockError; accept any LOCKED-shaped error
+  // (a string `code` plus optional `details`) so adapters stay dependency-free.
+  const code =
+    error instanceof LockError
+      ? error.code
+      : error !== null && typeof error === 'object' && typeof (/** @type {any} */ (error).code) === 'string'
+        ? /** @type {any} */ (error).code
+        : undefined
+  const detailValue =
+    error !== null && typeof error === 'object' ? /** @type {any} */ (error).details : undefined
+  const details =
+    detailValue !== null && typeof detailValue === 'object' && !Array.isArray(detailValue)
+      ? detailValue
+      : {}
+  if (code === APPLY_ERROR_CODES.LOCKED) {
+    const merged = {
+      ...details,
+      path: key,
+      owner: details.owner ?? null,
+      expiresAt: details.expiresAt ?? null,
+    }
+    return new ApplyError(
+      APPLY_ERROR_CODES.LOCKED,
+      `path "${key}" is already locked${merged.owner === null ? '' : ` by "${merged.owner}"`}` +
+        (merged.expiresAt === null
+          ? ''
+          : ` until ${new Date(/** @type {number} */ (merged.expiresAt)).toISOString()}`),
+      merged,
+    )
+  }
+  if (code === APPLY_ERROR_CODES.INVALID_ARGUMENT) {
+    return new ApplyError(
+      APPLY_ERROR_CODES.INVALID_ARGUMENT,
+      `lock provider rejected "${key}": ${messageOf(error)}`,
+      { ...details, path: key },
+    )
+  }
+  if (code !== undefined) {
+    return new ApplyError(
+      APPLY_ERROR_CODES.LOCK_FAILED,
+      `cannot acquire lock for "${key}": ${messageOf(error)}`,
+      { ...details, path: key, cause: code },
+    )
+  }
+  return new ApplyError(
+    APPLY_ERROR_CODES.LOCK_FAILED,
+    `cannot acquire lock for "${key}": ${messageOf(error)}`,
+    { path: key, cause: error instanceof Error ? error.code : undefined },
+  )
+}
+
+/**
+ * Acquire one lock per normalized path, in sorted order, so two applies that
+ * overlap always contend in the same order. On the first failure, handles
+ * already acquired by this call are released before the error propagates.
+ *
+ * @param {{ acquire: (key: string, options: { ttlMs: number, owner: string }) => Promise<any>, release: Function }} provider
+ * @param {string[]} normalizedPaths
+ * @param {{ ttlMs: number, owner: string }} options
+ */
+async function acquirePathLocks(provider, normalizedPaths, options) {
   const ordered = [...new Set(normalizedPaths)].sort()
-  /** @type {Map<string, { path: string, lockPath: string }>} */
-  const acquired = new Map()
+  /** @type {any[]} */
+  const acquired = []
   try {
-    for (const relativePath of ordered) {
-      const lockPath = path.join(lockDir, lockFileName(relativePath))
-      let handle
+    for (const key of ordered) {
       try {
-        handle = await fs.open(lockPath, 'wx', 0o600)
+        acquired.push(await provider.acquire(key, options))
       } catch (error) {
-        if (error instanceof Error && error.code === 'EEXIST') {
-          let holder = null
-          try {
-            holder = JSON.parse(await fs.readFile(lockPath, 'utf8'))
-          } catch {
-            // A malformed/stale lock is still a lock.
-          }
-          throw new ApplyError(
-            APPLY_ERROR_CODES.LOCKED,
-            `path "${relativePath}" is already locked by another apply` +
-              (holder && holder.pid !== undefined ? ` (pid ${holder.pid})` : ''),
-            { path: relativePath, lockPath, holder },
-          )
-        }
-        throw new ApplyError(
-          APPLY_ERROR_CODES.LOCK_FAILED,
-          `cannot acquire lock for "${relativePath}": ${messageOf(error)}`,
-          {
-            path: relativePath,
-            lockPath,
-            cause: error instanceof Error ? error.code : undefined,
-          },
-        )
-      }
-      acquired.set(relativePath, { path: relativePath, lockPath })
-      try {
-        await handle.writeFile(
-          `${JSON.stringify({
-            pid: process.pid,
-            path: relativePath,
-            createdAt: new Date().toISOString(),
-          })}\n`,
-        )
-        await handle.sync()
-      } finally {
-        await handle.close()
+        throw toApplyLockError(error, key)
       }
     }
   } catch (error) {
-    await releaseLocks(acquired)
+    await releasePathLocks(provider, acquired)
     throw error
   }
   return {
     paths: ordered,
-    release: async () => releaseLocks(acquired),
+    release: async () => releasePathLocks(provider, acquired),
   }
 }
 
@@ -1386,8 +1473,14 @@ async function readJournalFile(journalPath, journalDir, options = {}) {
  * `{ path, before?, after }` entries is also accepted; a journal id is
  * generated when `patchset.id` is absent.
  *
+ * Locks are acquired through `options.lockProvider` when supplied, otherwise
+ * through a `FileLockProvider` over `<root>/.dsh-os-lease/locks`. The lock TTL
+ * must outlive the apply; a lock that expires mid-apply can be reclaimed by a
+ * second process. Use `lockTtlMs` to tune it and `lockOwner` to make the
+ * holder identifiable in `LOCKED` errors (the default is `apply:<pid>`).
+ *
  * @param {{ id?: string, leaseId?: string, files: PatchsetInputFile[] } | PatchsetInputFile[]} patchset
- * @param {{ root: string, verifyBefore?: boolean }} options
+ * @param {{ root: string, verifyBefore?: boolean, lockProvider?: object, lockTtlMs?: number, lockOwner?: string }} options
  * @returns {Promise<any>} The journal, hydrated with `journalPath` and `dir`.
  */
 export async function applyPatchset(patchset, options) {
@@ -1398,9 +1491,13 @@ export async function applyPatchset(patchset, options) {
     mode: 0o700,
     label: 'state directory',
   })
+  const lockProvider =
+    settings.lockProvider ??
+    new FileLockProvider({ dir: path.join(stateDir, LOCK_DIRNAME) })
   const lock = await acquirePathLocks(
-    stateDir,
+    lockProvider,
     normalized.files.map((file) => file.path),
+    { ttlMs: settings.lockTtlMs, owner: settings.lockOwner },
   )
   let journalRoot = null
   let journalDir = null

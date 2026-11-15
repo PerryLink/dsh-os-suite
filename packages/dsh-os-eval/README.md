@@ -2,7 +2,7 @@
 
 > Regression eval gates for DSH agents: case definitions, baseline comparison and CI verdicts.
 
-**0.2.0 · pure ESM + JSDoc · Node 24+ · Apache-2.0**
+**0.2.1 · pure ESM + JSDoc · Node 24+ · Apache-2.0**
 
 A community project. Not affiliated with DeepSeek. No SLA, no warranty.
 
@@ -17,9 +17,11 @@ renamed tool can break an instruction without anyone noticing.
 
 - **Cases are data.** A case has an id, input, expectations, and tags. No test
   framework required.
-- **Runs are replayable.** A recorded session can be read from one exported
-  JSONL file, paired into a tool trajectory, and graded deterministically. A
-  host runner and a mock remain available when no recording is supplied.
+- **Runs are replayable.** A session can be read live through DSH
+  `session-query` (`ctx.sessionQuery.readSession(sessionId)`) or from one
+  exported JSONL file, paired into a tool trajectory, and graded
+  deterministically. A host runner and a mock remain available when neither
+  source is supplied.
 - **Baselines are explicit.** Compare token usage with a stored p50 and turn a
   >20% regression into a WARN instead of a surprise bill.
 - **CI gets one verdict.** `PASS`, `WARN`, or `FAIL`, with reasons and the
@@ -88,9 +90,25 @@ its path as `sessionFile`:
 }
 ```
 
-The recording wins over an injected host runner and over `mock`; the fallback
-chain is **sessionFile → host runner → mock**. There is no implicit model call
-in any branch. Without a recording or an injected runner, pass a `mock` result.
+To grade a live or persisted session without exporting it, pass its id as
+`liveSessionId`. The adapter calls `ctx.sessionQuery.readSession(sessionId)` and
+grades the returned `SessionLogSnapshot` exactly like an exported recording:
+
+```json
+{
+  "caseId": "live-greeting",
+  "liveSessionId": "01KSESSIONID"
+}
+```
+
+`sessionFile` and `liveSessionId` are mutually exclusive. Either source wins over
+an injected host runner and over `mock`; the fallback chain is
+**liveSessionId | sessionFile → host runner → mock**. There is no implicit model
+call in any branch. If the host has no `sessionQuery` service, `liveSessionId`
+fails with a clear `SESSION_QUERY_UNAVAILABLE` error instead of falling through
+to the runner or the mock; `sessionFile` and the runner/mock paths keep working.
+
+Without a session source or an injected runner, pass a `mock` result.
 
 ## Tools
 
@@ -106,17 +124,19 @@ run.
 |---|---|---|
 | `caseId` | string (required) | Id of a configured case, or of the inline `case`. |
 | `case` | object | Optional inline `{ id, name, input, expect, tags? }`. Duplicate ids are rejected. |
-| `sessionFile` | string | Path to one exported, uncompressed session `.jsonl` file. Highest precedence. |
-| `mock` | object | Mock runner result: `{ output?, steps?, tokens?, latencyMs? }`. Used only when neither `sessionFile` nor a host runner is present. |
+| `sessionFile` | string | Path to one exported, uncompressed session `.jsonl` file. Mutually exclusive with `liveSessionId`; highest precedence when supplied. |
+| `liveSessionId` | string | Id of a live or persisted session read through `ctx.sessionQuery.readSession`. Mutually exclusive with `sessionFile`; highest precedence when supplied. |
+| `mock` | object | Mock runner result: `{ output?, steps?, tokens?, latencyMs? }`. Used only when neither a session source nor a host runner is present. |
 | `baseline` | object | Optional `{ passRate, p50Tokens }` to store and compare with this run. |
 
-Returns `{ run, comparison, trajectory }`. `run` is
-`{ caseId, output, steps, tokens, latencyMs, status, reasons }`. `trajectory`
-is `null` for a mock/host run; for a recording it is a compact summary
+Returns `{ run, comparison, trajectory, source }`. `run` is
+`{ caseId, output, steps, tokens, latencyMs, status, reasons }`, and `source` is
+`"live"`, `"file"`, or `null` (runner/mock). `trajectory` is `null` for a
+mock/host run; for a live or file session it is a compact summary
 (`sessionId`, `turns`, `messages`, `steps`, `tokens`, `latencyMs`, `paired`,
 `toolErrors`, `tools`) with no tool arguments or raw results.
 
-For a recorded session, `output` is the final non-empty assistant message,
+For a session-backed run, `output` is the final non-empty assistant message,
 `steps` is the number of paired tool calls, and `tokens` is the summed
 assistant-message usage. A runner exception or a missing expectation is still
 recorded as a `FAIL` run.
@@ -160,8 +180,15 @@ Verdict rules:
 
 Returns aggregate counts (`total`, `runCount`, `passed`, `failed`, `notRun`,
 `passRate`, `tokens`, `steps`) plus one summary row per case. It never includes
-raw runner output, only status, metrics, failure reasons, and — when the case
-was last run from a recording — a `trajectory` summary.
+raw runner output, only status, metrics, failure reasons, `source`, and — when
+the case was last run from a session — a `trajectory` summary.
+
+`source` is reported at three levels:
+
+- `source` on each case row: `"live"`, `"file"`, or `null`.
+- top-level `source`: `"live"`, `"file"`, `"mixed"`, or `null` when no selected
+  case has a recorded session.
+- top-level `sources`: `{ "live": n, "file": n }` counts over the selected rows.
 
 The top-level `trajectory` object aggregates the selected recorded cases:
 
@@ -179,7 +206,7 @@ The top-level `trajectory` object aggregates the selected recorded cases:
 ```
 
 Per-case `trajectory` is `null` for a mock/host run, and a later non-session run
-clears the stale summary. Optional `tags` uses the same AND filter as
+clears the stale summary and source. Optional `tags` uses the same AND filter as
 `eval_gate`.
 
 ## Recorded-session API
@@ -218,6 +245,48 @@ payloads, the `tool/call` / `tool/result` / `assistant/message` / `turn/*` and
 `trajectoryOf` pairs calls and results by `callId`, including results that
 arrive before their call; unanswered calls remain with `hasResult: false`.
 
+## Live-session API
+
+The `dsh-os-eval/live` subpath exposes the exact-read adapter directly. It reads
+one session through the optional `ctx.sessionQuery` service; it does **not**
+subscribe to the live event stream.
+
+```js
+import {
+  attach,
+  evaluateLive,
+  readLiveSession,
+  snapshotToJsonl,
+} from 'dsh-os-eval/live'
+
+const capability = attach(ctx)
+if (!capability.available) {
+  // capability.reason names the missing service
+}
+
+const session = await readLiveSession(ctx, '01KSESSIONID')
+const grades = await evaluateLive(ctx, '01KSESSIONID', [{
+  id: 'live-greeting',
+  name: 'Live greeting',
+  expect: { contains: ['hello'], maxSteps: 3, maxTokens: 200 },
+}])
+// grades.source === 'live'
+// grades.trajectory === compact summary (same shape as evaluate())
+// grades.toolTrajectory === trajectoryOf(session) steps for the caller
+```
+
+`readLiveSession` calls `ctx.sessionQuery.readSession(sessionId)` once, requires
+the returned `SessionLogSnapshot` to carry a session header and an events array,
+and converts it to the JSONL text accepted by `parseSessionJsonl` through
+`snapshotToJsonl(snapshot)`. `evaluateLive` composes the same `trajectoryOf` and
+`evaluate` building blocks as the file adapter. `attach(ctx)` only probes
+`ctx.sessionQuery.readSession` for availability; it registers no listener and
+caches nothing.
+
+Errors use stable `EvalError` codes: `INVALID_SESSION_ID`,
+`SESSION_QUERY_UNAVAILABLE`, `SESSION_QUERY_READ_FAILED` (or the service's own
+stable `SESSION_QUERY_*` code), and `INVALID_SESSION_SNAPSHOT`.
+
 ## Scoring
 
 Every check in `expect` must hold; a single failure makes the run `FAIL`.
@@ -229,11 +298,11 @@ Every check in `expect` must hold; a single failure makes the run `FAIL`.
 | `maxSteps: number` | `steps <= maxSteps`. |
 | `maxTokens: number` | `tokens <= maxTokens`. |
 
-For a recorded session, `output` is the final non-empty assistant text (reasoning
-and tool-call blocks excluded), `steps` counts paired tool calls, and `tokens`
-sums `totalTokens` when present, otherwise input + output + cache-read +
-cache-write tokens. Tool arguments and result texts are available to `replay`
-callbacks but are not graded by `expect`.
+For a session-backed run (live or file), `output` is the final non-empty
+assistant text (reasoning and tool-call blocks excluded), `steps` counts paired
+tool calls, and `tokens` sums `totalTokens` when present, otherwise input +
+output + cache-read + cache-write tokens. Tool arguments and result texts are
+available to `replay` callbacks but are not graded by `expect`.
 
 A runner exception is recorded as a `FAIL` run with the error message, rather
 than crashing the gate.
@@ -241,33 +310,44 @@ than crashing the gate.
 ## Permissions and data
 
 - **No model, network, or shell access.** The core is pure logic. One sync
-  filesystem read happens only when a caller explicitly supplies `sessionFile`.
+  filesystem read happens only when a caller explicitly supplies `sessionFile`;
+  a `liveSessionId` read delegates one exact-read call to the host's
+  `ctx.sessionQuery` service.
 - **Visible-tool-run data.** The store keeps the latest run per case: caseId,
-  output, steps, tokens, latency, status, reasons, plus a compact trajectory
-  summary (session id, counts, tool names, error count). It does not keep
-  prompts, user/system messages, complete tool transcripts, or history.
+  output, steps, tokens, latency, status, reasons, `source`, plus a compact
+  trajectory summary (session id, counts, tool names, error count). It does not
+  keep prompts, user/system messages, complete tool transcripts, or history.
 - **Reports contain summaries only.** `eval_report` omits `output`, tool
-  arguments, and raw tool results. The programmatic `replay`/`evaluate` APIs
-  return step details to their caller; nothing is persisted by this package.
+  arguments, and raw tool results. The programmatic `replay`, `evaluate`, and
+  `evaluateLive` APIs return step details to their caller; nothing is persisted
+  by this package.
 - **Memory only.** Data lives for the lifetime of the plugin instance and is
   gone after a restart. Baselines are loaded from config, not from a database.
-- **Explicit file only.** `sessionFile` reads exactly the one path given by the
-  caller: no session-root discovery, no directory listing, no subagent archive
-  traversal. Treat exported logs as trusted fixtures.
+- **Explicit file or explicit session id.** `sessionFile` reads exactly the one
+  path given by the caller; `liveSessionId` reads exactly the one session id
+  given by the caller. There is no session-root discovery, directory listing, or
+  subagent archive traversal. Treat exported logs and session data as trusted
+  fixtures.
 - **Injected runners run with host permissions.** If a host supplies
   `apply(ctx, { runner })`, that code can do anything the host can do. Audit it
   like any other plugin, and never put secrets in cases, mocks, or recordings.
 
-## Limitations (0.2.0)
+## Limitations (0.2.1)
 
-- **Reads exported plain-text JSONL only.** There is no OTel exporter, no
-  session-query integration, and no live-session or session-database read.
-  Zstandard-compressed logs (`.jsonl.zstd`), session directories, and exported
-  ZIP archives are not supported; use the host's Export session action and
-  pass the resulting uncompressed `.jsonl` file.
+- **Reads files or exact session snapshots, not streams.** Exported plain-text
+  JSONL (`sessionFile`) and `ctx.sessionQuery.readSession(sessionId)`
+  (`liveSessionId`) are supported. There is no live event-stream subscription,
+  no OTel exporter, and no direct session-database read. Zstandard-compressed
+  logs (`.jsonl.zstd`), session directories, and exported ZIP archives are not
+  supported; use the host's Export session action and pass the resulting
+  uncompressed `.jsonl` file.
 - **Recorded output replay, not live model replay.** `replay` invokes only the
   local synchronous callback it is given. The package never calls a model,
-  re-runs a prompt, or compares against a fresh live run.
+  re-runs a prompt, or compares against a fresh live run. A `liveSessionId` read
+  grades the session's already-recorded events, not a new generation.
+- **No session-query subscription.** `attach(ctx)` probes availability only; the
+  plugin does not observe session events as they arrive. Re-run `eval_run` after
+  a session grows to grade a newer snapshot.
 - **Synchronous runners only.** Returning a Promise raises
   `ASYNC_RUNNER_UNSUPPORTED`.
 - **One latest run per case.** No repeated runs, flake detection, confidence

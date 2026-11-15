@@ -1,6 +1,6 @@
 # dsh-os-lease — Design
 
-Status: MVP (`0.1.0`). Pure ESM JavaScript + JSDoc, no build step.
+Status: MVP (`0.2.0`). Pure ESM JavaScript + JSDoc, no build step.
 Core logic lives in `src/core.js` and imports nothing from `@deepseek-ai/*`.
 
 ## 1. Problem
@@ -210,9 +210,10 @@ The opt-in applier (`src/apply.js`) implements the file-writing half:
 
 1. Before writing, it checks that each path is inside the canonical `root` and
    refuses symbolic links and the reserved `.dsh-os-lease` tree.
-2. It acquires one `fs.open(..., 'wx')` lock file per normalized path, then
-   backs up the real pre-images to
-   `.dsh-os-lease/journal/<patchsetId>/backups/`.
+2. It acquires one lock per normalized path through a pluggable provider
+   (default: `FileLockProvider` over `.dsh-os-lease/locks`, one `wx`-created
+   JSON record per key with `owner`/`token`/`expiresAt`), then backs up the
+   real pre-images to `.dsh-os-lease/journal/<patchsetId>/backups/`.
 3. It writes each file via temp file + fsync + rename, then marks the journal
    `applied`.
 4. On any apply failure it restores the journaled entries in reverse order.
@@ -225,13 +226,40 @@ The opt-in applier (`src/apply.js`) implements the file-writing half:
 applier is a separate module precisely so the lease/plan layer cannot become an
 unverified file writer by default.
 
+### Lock provider layer
+
+`src/lock.js` isolates the mutual-exclusion primitive behind
+`acquire(key, { ttlMs, owner })`, `renew(handle, { ttlMs })`,
+`release(handle)`, and `inspect(key)`:
+
+- Every handle carries a random `token`. `renew` and `release` verify it, so an
+  expired holder cannot mutate a lock that a newer owner has acquired.
+- `FileLockProvider` keeps one `<sha256(key)>.lock` file per key. Creation is
+  `wx`; expiry is evaluated against the provider clock; reclaim renames the
+  stale file and retries. Malformed/legacy files without `expiresAt` are held
+  conservatively (no automatic reclaim).
+- `MemoryLockProvider` mirrors the contract in a `Map` for tests; instances do
+  not share state.
+- `withLock(provider, key, fn, options)` releases on success and on throw.
+- `applyPatchset` accepts `lockProvider`, `lockTtlMs`, and `lockOwner`; the
+  default is a file provider at `<root>/.dsh-os-lease/locks` with a 15-minute
+  TTL. Lock acquisition happens before any journal or target write, and
+  `LOCKED` errors carry `details.owner`/`details.expiresAt`.
+
+Cross-host behavior is deliberately documented as a lease, not a strong
+distributed lock: shared NFSv4/SMB 3.x mounts with atomic `O_EXCL`/rename and
+bounded clock skew can work; FUSE/cloud-sync mounts cannot; reclaim and release
+retain small TOCTOU windows; the target filesystem does not enforce fencing.
+See `docs/cross-host-locks.md` for conditions, TTL/clock guidance, and Redis/SQL
+interface sketches (not implemented here).
+
 ### Cordis / future service layer
 
 The manager is currently per plugin instance. A shared Cordis service (one
 manager per profile, keyed by workspace) plus persistence would let multiple
-tools and plugins coordinate without each holding its own state. Cross-process
-coordination needs an OS-level lock or a small lease daemon; that is roadmap,
-not MVP.
+tools and plugins coordinate without each holding its own state. The applier
+already coordinates cooperating processes through the lock provider; lease
+*state* is still in memory and would need a daemon or persistence to be shared.
 
 ## 6. Failure modes
 
@@ -247,15 +275,18 @@ not MVP.
 | Patchset touches unleased paths | `prepare` throws `PATH_NOT_LEASED` | Extend the lease paths before staging |
 | Invalid/escaping path | `INVALID_PATH` / `RESERVED_PATH` | Use workspace-relative literal paths away from `.dsh-os-lease` |
 | Symlink on a target path | `SYMLINK_NOT_ALLOWED` / `PATH_ESCAPE` | Use real directories; the applier refuses links even inside `root` |
-| Overlapping applies on one host | `LOCKED` from `fs.open('wx')` | Retry after the other apply finishes, or use disjoint paths |
+| Overlapping applies (same host, or shared FS) | `LOCKED` with the holder's `owner`/`expiresAt` from the lock provider | Retry after the other apply finishes, wait for the TTL, inspect with `provider.inspect(key)`, or use disjoint paths |
 | Caller-supplied `before` is stale | Not detected by core; applier records `beforeMatches` and backs up the real pre-image | Enable `verifyBefore: true` to reject a mismatch |
 | External process edits a leased path | Not detected (no fs watch) | Applier locks only coordinate applies; use single-writer discipline |
 | Apply fails mid-patchset | Journal marks `applying` / `applyFailed`; recovery restores in reverse | Inspect/run `rollback(journal)`; journal is retained when recovery fails |
 | Rollback backup is missing | `ROLLBACK_FAILED` with per-path `BACKUP_MISSING` | Restore the journal backup, then retry rollback; it is idempotent |
 | DSH process restart | Leases/patchsets lost; journals and locks remain | Reacquire; use a fresh patchset id if an old journal id exists |
-| Two DSH processes | Managers do not see each other's leases; applier lock files still exclude same-path applies | Future daemon for shared lease state |
-| Case-insensitive filesystem | `src/A` and `src/a` are distinct | Future canonicalization by workspace filesystem |
-| Clock skew / injected clock | TTL decisions follow the injected clock | Tests inject deterministic clocks; production uses `Date.now()` |
+| Two DSH processes | Managers do not see each other's leases; the same provider (file on a shared FS, or a custom adapter) excludes same-path applies | Future daemon for shared lease state; shared FS needs `docs/cross-host-locks.md` conditions |
+| Two hosts, no shared FS | Each host's lock directory is private; both can acquire the same key | Use one shared mount or a custom cross-host provider; the local default does not coordinate |
+| FUSE / cloud-sync mount | `wx`/rename are emulated; cross-host exclusion is unreliable | Unsupported: put the lock directory on NFSv4/SMB 3.x or use a custom provider |
+| Stale lock file | Reclaimed automatically once `expiresAt` elapses; legacy records without expiry never are | Choose a TTL; delete legacy files manually after confirming no apply is running |
+| Case-insensitive filesystem | `src/A` and `src/a` are distinct keys | Future canonicalization by workspace filesystem |
+| Clock skew / injected clock | TTL decisions follow the provider clock; skew can shorten or extend a lease | Keep skew far below the TTL; tests inject deterministic clocks |
 | Memory growth from large patchsets | Bodies retained until manager dies | No size bound yet; prefer small patchsets; status never echoes bodies |
 
 ## 7. Security and permissions
@@ -263,10 +294,14 @@ not MVP.
 The manager has no filesystem, process, network, or environment access. Its
 only authority is the DSH tool call. The applier is a separate opt-in module:
 it reads and writes only under the configured canonical `root`, rejects symlinks
-on the target chain, and keeps pre-images in `.dsh-os-lease/`. `owner` is a
-label, not an authenticated identity: any agent allowed to call the tools can
-release or renew any lease it can name. If multi-tenant isolation is required,
-an outer authorization layer must enforce agent-to-owner binding. Do not store
+on the target chain, and keeps pre-images in `.dsh-os-lease/`. The default
+lock provider only touches the lock directory; a custom `lockProvider` is
+host-supplied code and may use a network service, so apply the same trust review
+as any other dependency. `owner` is a label, not an authenticated identity: any
+agent allowed to call the tools can release or renew any lease it can name, and
+a lock token is a bearer capability for `renew`/`release`. If multi-tenant
+isolation is required, an outer authorization layer must enforce
+agent-to-owner binding. Do not store
 secrets in `before`/`after`; they remain in memory and are visible to anyone who
 can query a live manager (though `workspace_status` omits bodies). With the
 applier enabled, `before`/`after` bodies and on-disk pre-images are written to
@@ -285,7 +320,9 @@ the journal/backups on disk, so protect `.dsh-os-lease/` accordingly.
 - Opt-in applier reads actual pre-images, optionally verifies `before` at write
   time, writes via temp file + fsync + rename, and records results.
 - Journal-backed rollback restores/deletes in reverse order and is idempotent.
-- Per-path lock files exclude overlapping applies on the same host.
+- Pluggable per-path locks (implemented in `0.2.0`): `FileLockProvider` with
+  owner/expiry records and stale reclaim, `MemoryLockProvider`, `withLock`, and
+  custom providers through `applyPatchset({ lockProvider })`.
 - Remaining: integrate with DSH edit/write intent; emit commit/rollback events
   for audit.
 
@@ -296,13 +333,18 @@ the journal/backups on disk, so protect `.dsh-os-lease/` accordingly.
 - Metrics: lease wait time, conflict rate, patchset size, commit failures.
 
 **Days 22–30 — multi-process and release**
-- Cross-process locking (daemon or lock files) with crash recovery.
+- File locks already coordinate processes on one host and, with the documented
+  shared-FS conditions, across hosts. Remaining: a first-party Redis/SQL
+  provider (or daemon), renew-during-apply, and fencing-token integration.
 - Case/symlink canonicalization strategy per workspace.
 - Stress tests for concurrent agents, docs/examples, changelog, publish
   `0.2.0` after rechecking the package name.
 
 ## 9. Non-goals
 
+- A strong, linearizable distributed lock or a fencing service. The lock layer
+  is a cooperative TTL lease; stronger semantics belong in a provider backed by
+  Redis/SQL/etcd or a workspace daemon.
 - A general filesystem snapshot/restore system.
 - A VCS replacement or merge engine.
 - Authenticated multi-tenant authorization.

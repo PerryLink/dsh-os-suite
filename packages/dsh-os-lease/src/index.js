@@ -7,6 +7,7 @@ import {
   readJournal,
   rollback,
 } from './apply.js'
+import { LockError, assertLockProvider } from './lock.js'
 
 export const name = 'dsh-os-lease'
 export const inject = ['tools']
@@ -72,8 +73,13 @@ function renderJson(value) {
  * rejects a write when the caller's `before` body does not match the file on
  * disk.
  *
+ * `config.lockProvider` lets an embedding host inject a custom lock provider;
+ * `config.lockTtlMs` / `config.lockOwner` tune the provider invocation. The
+ * defaults are a `FileLockProvider` under `<root>/.dsh-os-lease/locks`, a
+ * 900000 ms TTL, and `apply:<pid>` as the owner.
+ *
  * @param {import('@deepseek-ai/cordis').Context} ctx
- * @param {{ apply?: boolean, root?: string, verifyBefore?: boolean }} [config]
+ * @param {{ apply?: boolean, root?: string, verifyBefore?: boolean, lockProvider?: object, lockTtlMs?: number, lockOwner?: string }} [config]
  */
 export function apply(ctx, config = {}) {
   if (config === null || typeof config !== 'object' || Array.isArray(config)) {
@@ -96,6 +102,37 @@ export function apply(ctx, config = {}) {
   const verifyBefore = config.verifyBefore === true
   if (writeEnabled && writeRoot === undefined) {
     throw new TypeError('dsh-os-lease: config.apply=true requires config.root')
+  }
+  let lockProvider
+  if (config.lockProvider !== undefined) {
+    try {
+      lockProvider = assertLockProvider(config.lockProvider)
+    } catch (error) {
+      throw new TypeError(
+        `dsh-os-lease: config.lockProvider is invalid: ${
+          error instanceof LockError ? error.message : String(error)
+        }`,
+      )
+    }
+  }
+  if (
+    config.lockTtlMs !== undefined &&
+    (typeof config.lockTtlMs !== 'number' ||
+      !Number.isFinite(config.lockTtlMs) ||
+      config.lockTtlMs < 1)
+  ) {
+    throw new TypeError('dsh-os-lease: config.lockTtlMs must be a positive number')
+  }
+  if (
+    config.lockOwner !== undefined &&
+    (typeof config.lockOwner !== 'string' ||
+      config.lockOwner.trim() === '' ||
+      config.lockOwner.length > 256 ||
+      /[\u0000-\u001f\u007f]/.test(config.lockOwner))
+  ) {
+    throw new TypeError(
+      'dsh-os-lease: config.lockOwner must be a 1-256 character string without control characters',
+    )
   }
 
   const manager = createLeaseManager()
@@ -257,6 +294,9 @@ export function apply(ctx, config = {}) {
                 const journal = await applyPatchset(patchset, {
                   root: writeRoot,
                   verifyBefore,
+                  lockProvider,
+                  lockTtlMs: config.lockTtlMs,
+                  lockOwner: config.lockOwner,
                 })
                 return { ...result, applied: true, journal }
               } catch (error) {

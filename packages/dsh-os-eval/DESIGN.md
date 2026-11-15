@@ -1,8 +1,10 @@
 # dsh-os-eval — design
 
-Status: 0.1.2 (2026-11-15). Pure ESM, no build. Core logic is offline-testable
+Status: 0.2.0 (2026-11-15). Pure ESM, no build. Core logic is offline-testable
 and imports no `@deepseek-ai/*` package. The read-only exported-JSONL adapter
-lives in `src/session.js`; it adds I/O only for the one file a caller names.
+lives in `src/session.js`; `src/live.js` adds one exact-read call through the
+optional `ctx.sessionQuery.readSession` seam. Both adapters read only the one
+source a caller names.
 
 ## 1. Problem
 
@@ -140,9 +142,13 @@ into the same run shape; the scorer and gate do not change.
 
 `src/session.js` parses plain-text DSH session JSONL, pairs `tool/call` with
 `tool/result` on the call id, and exposes `parseSessionJsonl`, `trajectoryOf`,
-`replay`, and `evaluate`. `eval_run` accepts one explicit `sessionFile` path;
-`eval_report` adds a compact trajectory summary. There is no live-session,
-session-query, OTel, or compressed-log read.
+`replay`, and `evaluate`. `src/live.js` adds an exact-read adapter over the
+optional `ctx.sessionQuery.readSession(sessionId)` seam: it converts the
+returned `SessionLogSnapshot` back to the same JSONL shape and grades it with
+the same store. `eval_run` accepts one `sessionFile` path or one
+`liveSessionId` (mutually exclusive); `eval_report` adds a compact trajectory
+summary and the `live`/`file` source. The adapter never subscribes to session
+events, never calls a model, and does not support OTel or compressed logs.
 
 Trajectory storage is deliberately outside core. This keeps the package free of
 session schemas and makes the data policy simple: summaries in, summaries out.
@@ -222,11 +228,25 @@ The module imports `core.js` and `node:fs` only. `core.js` remains free of
 session schemas and I/O. Read failures surface as adapter errors before a run is
 recorded, not as a fake PASS.
 
-### session-query (not implemented)
+### session-query exact reads (implemented in 0.2.0)
 
-Live session-query reads are out of scope for 0.1.2. The current boundary is one
-exported file; there is no query-by-id/tag, no session-root discovery, and no
-session service injection.
+`src/live.js` is the adapter:
+
+1. Probe `ctx.sessionQuery.readSession` through `attach(ctx)`; the service is not
+   a required injection, and probing subscribes to nothing.
+2. Call `readSession(sessionId)` once and require a `SessionLogSnapshot` with a
+   session header id and an events array.
+3. Serialize the header and each event back to plain JSONL through
+   `snapshotToJsonl`, then reuse `parseSessionJsonl` so live and file runs cannot
+   drift in parsing or scoring.
+4. Expose `evaluateLive(ctx, sessionId, cases)`, which composes `trajectoryOf`
+   and `evaluate`; `eval_run` records the same run shape and `eval_report` marks
+   the source as `live` or `file`.
+
+A missing service fails only the `liveSessionId` path, with
+`SESSION_QUERY_UNAVAILABLE`; `sessionFile`, the host runner, and the mock remain
+usable. There is still no event-stream subscription, no query-by-tag, no
+session-root discovery, and no OTel or compressed-log read.
 
 ### OTel (not implemented)
 
@@ -282,9 +302,11 @@ can be posted as a PR check without parsing prose.
 
 ## 10. Security and privacy
 
-- Core has no I/O; the session adapter reads only the one `sessionFile` path a caller names.
-- No raw messages, prompts, tool arguments, or tool results are persisted by this package; reports carry counts, tool names, and error counts only.
-- `eval_report` returns status, metrics, reasons, and compact trajectory summaries; `eval_run` returns the run object including output to its caller.
+- Core has no I/O; the session adapters read only the one `sessionFile` path or
+  the one `liveSessionId` a caller names (the latter through the host's
+  `ctx.sessionQuery.readSession`).
+- No raw messages, prompts, tool arguments, or tool results are persisted by this package; reports carry counts, source, tool names, and error counts only.
+- `eval_report` returns status, metrics, reasons, source, and compact trajectory summaries; `eval_run` returns the run object including output to its caller. `evaluateLive` returns raw paired steps only to its programmatic caller.
 - Cases are trusted configuration. They are not a sandbox; an injected runner
   runs with host permissions.
 - Baselines contain only pass rate and p50 tokens.
@@ -294,7 +316,7 @@ can be posted as a PR check without parsing prose.
 | Window | Work | Exit criterion |
 |---|---|---|
 | Days 1–7 (2026-11-15 → 11-21) | Harden 0.1: fixture JSON loader, config validation, test coverage, pack dry-run, docs review. | `npm pack` succeeds; core tests green offline. |
-| Days 8–14 (11-22 → 11-28) | Exported-JSONL replay landed in 0.1.2; remaining: live `session-query` read, baseline JSON format, redaction rules. | More than one exported session can produce a `Run` without touching core. |
+| Days 8–14 (11-22 → 11-28) | Exported-JSONL replay landed in 0.1.2; live session-query exact reads landed in 0.2.0; remaining: baseline JSON format, redaction rules. | More than one source can produce a `Run` without touching core. |
 | Days 15–21 (11-29 → 12-05) | CLI (`run`/`gate`/`report`), exit codes, JUnit XML, repeated-run support (k, p50); OTel span adapter spike. | A local CI script blocks on FAIL and annotates WARN. |
 | Days 22–30 (12-06 → 12-14) | GitHub Actions example, strict coverage mode, baseline freshness policy, security review, naming recheck, 0.2.0. | A real repository runs the gate in CI; release notes list adapters and limits. |
 

@@ -7,7 +7,7 @@
 >
 > Causal audit and tamper-evident evidence bundles for DSH agent runs.
 
-**状态：源码在 0.2.0 基础上加入实时事件采集与 HMAC 签名（尚未发布到 npm；npm 上的 0.2.0 不含这些能力）。** 社区项目，非 DeepSeek 官方项目，Apache-2.0，无 SLA。
+**状态：源码在 0.2.1 基础上加入实时事件采集、HMAC 签名与 OTLP/JSON 导入导出（尚未发布到 npm；npm 上的 0.2.1 不含这些能力）。** 社区项目，非 DeepSeek 官方项目，Apache-2.0，无 SLA。
 
 ## 为什么
 
@@ -18,7 +18,7 @@ DSH 的 session 日志能回答「发生过什么」，但很难直接回答下�
 3. **审计时如何证明没被改过？** 导出一份 JSON 交给别人，对方无法判断某条记录是否被删改、重排或拼接。
 4. **分享时如何不泄露密钥？** `attrs` 里经常带 API key、token、请求头；直接导出等于泄密。
 
-`dsh-os-trace` 在**用户级**补这一层：默认订阅 DSH 的 tool / approval / agent / subagent / job / MCP / session 事件，以 span 为最小事件沿 `parentId` 组成因果图；结束的 span 进入一条 SHA-256 哈希链；导出时可按字段名递归脱敏并重新封链，也可用 HMAC-SHA256 签名；校验时返回第一个坏掉的 span。它不替换 DSH 日志，也不采集 OTel；它是日志之上的一层**可解释 + 可验证**视图。
+`dsh-os-trace` 在**用户级**补这一层：默认订阅 DSH 的 tool / approval / agent / subagent / job / MCP / session 事件，以 span 为最小事件沿 `parentId` 组成因果图；结束的 span 进入一条 SHA-256 哈希链；导出时可按字段名递归脱敏并重新封链，也可用 HMAC-SHA256 签名；校验时返回第一个坏掉的 span。它不替换 DSH 日志，也不接 OTel 采集；它是日志之上的一层**可解释 + 可验证**视图，并额外提供 **OTLP/JSON 的离线导入/导出**（见下文）。
 
 ## 安装
 
@@ -88,7 +88,7 @@ Cordis 事件总线没有通配符派发：本包会把 `approval/*` 等模式�
 
 ## 五个工具
 
-所有工具只读内存 store 与采集器状态，返回结构化 JSON；不会写文件、不会联网。工具参数由 DSH 在调用前校验。
+所有工具只读内存 store 与采集器状态，返回结构化 JSON；不会写文件、不会联网。工具参数由 DSH 在调用前校验。离线 CLI（`trace_export` / `trace_import`）是独立入口，见「OTLP/JSON 互操作」。
 
 ### `trace_query`
 
@@ -198,6 +198,68 @@ Cordis 事件总线没有通配符派发：本包会把 `approval/*` 等模式�
 - `ignored`：未知或无法映射的事件；`errors`：采集器内部错误，永远不会抛给 agent 主循环。
 - `wildcard`：是否成功安装 `internal/dispatch` 家族兜底钩子。
 
+## OTLP/JSON 互操作（离线导入/导出）
+
+本包提供**离线**的 OTLP/JSON 互操作：`src/otlp.js` 在现有 span 形状与 OTLP trace JSON 之间转换，CLI 可直接转文件。它**不是** OTLP SDK/Collector：不走 gRPC、不处理 protobuf、不接 OpenTelemetry SDK、不做自动上报，也不传播 W3C trace context；只处理单个 OTLP/JSON 文档的 trace 部分（`resourceSpans[].scopeSpans[].spans[]`）。
+
+### 代码 API
+
+```js
+import { toOtlp, fromOtlp } from 'dsh-os-trace/otlp'
+
+const otlp = toOtlp(store.query(), { serviceName: 'my-dsh' })
+const spanInputs = fromOtlp(otlp)   // 可直接交给 store.ingest()
+const fromText = fromOtlp(fs.readFileSync('traces.json', 'utf8'))
+```
+
+- `toOtlp(spans, { serviceName = 'dsh' })`：输出一条 `resourceSpans`；`resource.attributes` 只有 `service.name`，`scopeSpans[0].scope.name` 为 `"dsh-os-trace"`。
+- `fromOtlp(json)`：接受对象或 JSON 文本，返回现有 span 输入数组；不返回 `hash`/`prevHash`，由 `createTraceStore().ingest()` 重新封链。坏 JSON / 坏外层结构抛 `INVALID_OTLP`。
+- 包主入口也 re-export 了 `toOtlp` / `fromOtlp`。
+
+### 字段映射
+
+| DSH span | OTLP span |
+|---|---|
+| `id` | `spanId = sha256(id)` 前 8 字节（16 hex）；原 id 存入 `dsh.span.id` |
+| `parentId` | `parentSpanId = sha256(parentId)` 前 8 字节；原 parentId 存入 `dsh.span.parent_id` |
+| `sessionId` | `traceId = sha256(sessionId)` 前 16 字节（32 hex）；无 sessionId 时改用根 span id；原值存入 `dsh.span.session_id` |
+| `kind` | `SPAN_KIND_INTERNAL`；原值存入 `dsh.span.kind` |
+| `name` | `name` |
+| `startMs` / `endMs` | `startTimeUnixNano` / `endTimeUnixNano`，`毫秒 × 1e6` 的十进制字符串；无 `endMs` 时不写 |
+| `status` | `ok`/`running` → `status.code: 1`，`error` → `2`；`running` 的原值另存 `dsh.span.status` |
+| `attrs` | `attributes`；字符串/布尔/安全整数/浮点分别用 `stringValue`/`boolValue`/`intValue`/`doubleValue`，数组/对象用 `arrayValue`/`kvlistValue` |
+| `agentPath` | `dsh.span.agent_path` |
+| `hash` / `prevHash` | 不导出；OTLP 没有等价链 |
+
+- `dsh.span.*` 是保留属性命名空间；导入时这些键会从 `attrs` 中剔除。用户 attrs 不应使用该前缀。
+- 本包自己导出的 span 可以 round-trip 回 id、parent、status、kind、agentPath、attrs 与时间，前提是保留 `dsh.span.*` 元数据；`null`/`undefined` attrs 不写入（OTLP 没有 null AnyValue）。
+- 外部 OTLP 的缺省：没有 `dsh.span.*` 时 `id = spanId`、`sessionId = traceId`、`kind = "workflow"`、`name = "unnamed"`、缺失时间为 0；无 end 且 status code 为 0 视为 `running`，code 2 为 `error`，其余为 `ok`。
+- 外部的未知 span attributes 尽量保留到 `attrs`（含嵌套 AnyValue；`bytesValue` 保留为 base64 字符串）。
+- **字段损失**：OTLP 没有本包的哈希链/HMAC 签名、DSH `kind`、`agentPath`（除非用保留属性）、除 `service.name` 外的资源属性、span links/events、W3C traceState；外部 span 的 OTLP `kind`/`status.message` 不映射；外部 `traceId` 也不原样保留（导入后仅作为缺省 `sessionId`，再导出会按本包规则重新派生）。导入后重新封链，所以不能把导入 span 的 `hash` 当作 OTLP 来源的证据。
+- **不处理**：OTLP/gRPC、protobuf、OTLP metrics/logs、OTel SDK/Collector、自动上报、W3C trace context 注入/提取。
+
+### CLI
+
+包内 `src/cli.js` 提供离线转换（安装后命令名为 `dsh-os-trace`）：
+
+```sh
+# 默认仍输出本包 v1 bundle
+dsh-os-trace trace_export spans.json > bundle.json
+
+# 导出 OTLP/JSON（stdout；也可 --out traces.json）
+dsh-os-trace trace_export bundle.json --format otlp > traces.json
+
+# 读入 OTLP/JSON，重新封链并输出 v1 bundle
+dsh-os-trace trace_import traces.json --format otlp --out bundle.json
+
+# 从 stdin 读
+cat spans.jsonl | dsh-os-trace trace_export --format otlp
+```
+
+- `trace_export` 自动接受 v1 bundle、OTLP/JSON、span 数组或 JSONL；`--format` 选**输出**格式，默认 `bundle`（仍输出 v1 证据包）。
+- `trace_import` 的 `--format` 选**输入**格式，默认 `bundle`（bundle 输入会先校验哈希链）；导入总是输出重新封链的 v1 bundle，不保留输入 bundle 的 `signature`。
+- 输入为空时输出空导出；坏 JSON / 坏 span 以退出码 2 失败，不打印堆栈。`--out` 是唯一的写文件路径。
+
 ## 证据格式
 
 每个 span 的哈希按下面的确定性规则计算：
@@ -230,7 +292,7 @@ signature = { "alg": "hmac-sha256", "sig": sig }
 ## 权限与数据
 
 - **只读会话数据。** 实时采集只订阅 DSH 事件总线（含 `internal/dispatch` 家族兜底观察钩子），不修改、不删除任何 session 数据；种子输入只读取 `dataFile` 或 `config.spans`。
-- **不写文件。** store 是进程内 Map；`trace_export` 只返回对象，不落盘。DSH 退出即丢失，除非调用方自己保存返回的 JSON。
+- **插件工具不写文件。** store 是进程内 Map；五个 DSH 工具只返回对象，不落盘。离线 CLI 仅在显式传 `--out` 时写 JSON（stdout 是默认输出）。DSH 退出即丢失，除非调用方自己保存返回的 JSON。
 - **不联网、不启子进程。** 没有 HTTP 客户端、shell 或进程管理。唯一接触文件系统的地方是启动时读取 `dataFile`。
 - **只在签名时读一个密钥。** `trace_export sign:true` 从 `config.secret` 或 `TESTATUM_KEY` 读取 HMAC 密钥；不落盘、不打印、不写入 bundle 或错误信息。不做身份验证、不读取其他凭据。
 - **无鉴权。** 能调用这五个工具的 agent 就能读取 store 里的全部 span；工具层权限由 DSH 的 tool policy 负责，本包不额外区分租户。
@@ -239,7 +301,7 @@ signature = { "alg": "hmac-sha256", "sig": sig }
 
 ## 限制
 
-- **仍不接 OTel / OTLP。** 没有 OTLP exporter/importer，不支持 W3C trace context 或 OpenTelemetry SDK 互操作。实时采集接的是 DSH 自己的事件总线，不是 OTel；导出的仍是本包自己的 v1 bundle。
+- **只做 OTLP/JSON 互操作，不接 OTel 运行时。** 没有 OTLP/gRPC、protobuf、OpenTelemetry SDK/Collector、自动上报或 W3C trace context 传播；`toOtlp`/`fromOtlp` 只转换单个 OTLP/JSON 文档的 trace 部分，且 OTLP 里没有本包的哈希链/HMAC 签名。实时采集接的仍是 DSH 自己的事件总线。
 - **实时采集是尽力而为。** Cordis 没有通配符事件派发，本包枚举当前 DSH 的已知事件名，并用 `internal/dispatch` 兜底；DSH 改事件名或字段后，未知事件会被忽略，不会伪造 span。MCP 生命周期事件目前只在产生方发事件时才可见；MCP 工具调用主要按 `mcp__` 名称前缀识别。采集器只有 attach 之后的内存态，不回放历史 session，重启即空。
 - **运行中的 span 不进哈希链。** 只有配对到结束事件的 span 才被 ingest；长时间不结束的 job/tool 只在 `trace_live_status` 里以 `running` 计数，不会出现在 `trace_export` 中。链顺序是**结束/ingest 顺序**，不是开始时间顺序。
 - **HMAC 不是透明日志。** 哈希链本身仍只是自洽性校验；`sign: true` 加的是共享密钥 HMAC-SHA256，不是 Ed25519/RSA 公钥签名，没有外部锚（Git commit、透明日志、时间戳服务）。持有同一密钥的人都能签发；它能证明「知道密钥的人签过这份 bundle」，不能证明签发者身份，也不能证明「它来自某个特定 DSH run」。签名格式与 `testatum-attest` v1 的 `signaturePayload`（canonical JSON 去掉 `signature`）兼容，`schema: "testatum/v1"` 可作为普通已签名对象接受，但这只是格式兼容，不是完整 trust card 语义。
@@ -270,7 +332,7 @@ node --test packages/dsh-os-trace/test/*.test.js
 node --check packages/dsh-os-trace/src/*.js
 ```
 
-`src/core.js` 不 import 任何 `@deepseek-ai/*`，可离线单测；`src/ingest.js` / `src/sign.js` 也不依赖 DSH 运行时。插件入口负责创建 store、装载种子输入、注册五个工具、按 `config.ingest !== false` 附加实时采集器。
+`src/core.js` 不 import 任何 `@deepseek-ai/*`，可离线单测；`src/ingest.js` / `src/sign.js` / `src/otlp.js` / `src/cli.js` 也不依赖 DSH 运行时。插件入口负责创建 store、装载种子输入、注册五个工具、按 `config.ingest !== false` 附加实时采集器。
 
 ## 许可
 

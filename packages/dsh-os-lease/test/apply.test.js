@@ -10,6 +10,7 @@ import {
   readJournal,
   rollback,
 } from '../src/apply.js'
+import { FileLockProvider, MemoryLockProvider } from '../src/lock.js'
 
 /**
  * @param {import('node:test').TestContext} t
@@ -393,6 +394,123 @@ test('a directory target is refused rather than replaced', async (t) => {
     'NOT_A_FILE',
   )
   assert.equal((await fs.stat(absolute(root, 'dir-target'))).isDirectory(), true)
+})
+
+test('applyPatchset accepts a custom lockProvider and releases after the apply', async (t) => {
+  const root = await makeRoot(t)
+  const provider = new MemoryLockProvider()
+  const held = await provider.acquire('a.txt', { ttlMs: 60_000, owner: 'other-agent' })
+
+  const calls = []
+  const acquire = provider.acquire.bind(provider)
+  provider.acquire = async (key, options) => {
+    calls.push({ key, ...options })
+    return acquire(key, options)
+  }
+
+  await assert.rejects(
+    applyPatchset(
+      { id: 'patch-custom-lock', files: [{ path: 'a.txt', after: 'x' }] },
+      { root, lockProvider: provider },
+    ),
+    (error) => {
+      assert.equal(error.name, 'ApplyError')
+      assert.equal(error.code, 'LOCKED')
+      assert.equal(error.details.path, 'a.txt')
+      assert.equal(error.details.owner, 'other-agent')
+      assert.equal(typeof error.details.expiresAt, 'number')
+      return true
+    },
+  )
+  await provider.release(held)
+
+  const journal = await applyPatchset(
+    { id: 'patch-custom-lock', files: [{ path: 'a.txt', after: 'x' }] },
+    { root, lockProvider: provider, lockTtlMs: 4321, lockOwner: 'host-a/agent-1' },
+  )
+  assert.equal(journal.status, 'applied')
+  assert.deepEqual(calls.at(-1), { key: 'a.txt', ttlMs: 4321, owner: 'host-a/agent-1' })
+  assert.equal((await provider.inspect('a.txt')).locked, false)
+
+  await assertApplyCode(
+    applyPatchset(
+      { id: 'patch-bad-provider', files: [{ path: 'b.txt', after: 'b' }] },
+      { root, lockProvider: {} },
+    ),
+    'INVALID_ARGUMENT',
+  )
+})
+
+test('a dependency-free custom provider can signal LOCKED with owner/expiresAt', async (t) => {
+  const root = await makeRoot(t)
+  const expiresAt = Date.now() + 60_000
+  // A custom provider is not required to import LockError: a string `code` and
+  // a `details` object are enough for the applier to preserve holder identity.
+  const provider = {
+    async acquire() {
+      const error = new Error('held by custom adapter')
+      error.code = 'LOCKED'
+      error.details = { owner: 'custom/agent', expiresAt }
+      throw error
+    },
+    async renew() {},
+    async release() {},
+    async inspect() {
+      return { locked: false }
+    },
+  }
+
+  await assert.rejects(
+    applyPatchset(
+      { id: 'patch-custom-error', files: [{ path: 'a.txt', after: 'x' }] },
+      { root, lockProvider: provider },
+    ),
+    (error) => {
+      assert.equal(error.name, 'ApplyError')
+      assert.equal(error.code, 'LOCKED')
+      assert.equal(error.details.path, 'a.txt')
+      assert.equal(error.details.owner, 'custom/agent')
+      assert.equal(error.details.expiresAt, expiresAt)
+      return true
+    },
+  )
+  await assert.rejects(fs.stat(absolute(root, 'a.txt')), { code: 'ENOENT' })
+})
+
+test('the default file lock lives under .dsh-os-lease/locks and reports holder metadata', async (t) => {
+  const root = await makeRoot(t)
+  const lockPath = lockPathFor(root, 'a.txt')
+  const provider = new FileLockProvider({ dir: path.dirname(lockPath) })
+  const handle = await provider.acquire('a.txt', { ttlMs: 60_000, owner: 'host-b/agent-2' })
+
+  await assert.rejects(
+    applyPatchset(
+      { id: 'patch-default-lock', files: [{ path: 'a.txt', after: 'x' }] },
+      { root },
+    ),
+    (error) => {
+      assert.equal(error.name, 'ApplyError')
+      assert.equal(error.code, 'LOCKED')
+      assert.equal(error.details.path, 'a.txt')
+      assert.equal(error.details.owner, 'host-b/agent-2')
+      assert.equal(error.details.expiresAt, handle.expiresAt)
+      assert.equal(error.details.lockPath, lockPath)
+      return true
+    },
+  )
+
+  const record = JSON.parse(await fs.readFile(lockPath, 'utf8'))
+  assert.equal(record.owner, 'host-b/agent-2')
+  assert.equal(record.expiresAt, handle.expiresAt)
+
+  await provider.release(handle)
+  const journal = await applyPatchset(
+    { id: 'patch-default-lock', files: [{ path: 'a.txt', after: 'x' }] },
+    { root },
+  )
+  assert.equal(journal.status, 'applied')
+  assert.equal(await readText(root, 'a.txt'), 'x')
+  assert.equal((await provider.inspect('a.txt')).locked, false)
 })
 
 test('ApplyError carries a stable name and code', () => {

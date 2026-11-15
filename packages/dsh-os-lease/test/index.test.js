@@ -4,6 +4,7 @@ import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { apply, inject, name } from '../src/index.js'
+import { MemoryLockProvider } from '../src/lock.js'
 
 /**
  * @param {object} [config]
@@ -122,6 +123,73 @@ test('config apply:true without root is rejected at registration', () => {
     () => loadTools({ apply: true }),
     /config\.apply=true requires config\.root/,
   )
+  assert.throws(
+    () => loadTools({ apply: true, root: '/tmp', lockProvider: {} }),
+    /config\.lockProvider is invalid/,
+  )
+  assert.throws(() => loadTools({ lockTtlMs: 0 }), /config\.lockTtlMs must be a positive number/)
+  assert.throws(
+    () => loadTools({ lockOwner: '' }),
+    /config\.lockOwner must be a 1-256 character string/,
+  )
+})
+
+test('config lockProvider is honored by workspace_apply and released afterwards', async (t) => {
+  const root = await makeRoot(t)
+  const provider = new MemoryLockProvider()
+  const tools = loadTools({
+    apply: true,
+    root,
+    lockProvider: provider,
+    lockTtlMs: 5000,
+    lockOwner: 'host-a/agent-1',
+  })
+
+  const firstLease = await tools.get('workspace_lease').execute({
+    action: 'acquire',
+    workspace: '/repo',
+    paths: ['a.txt'],
+    owner: 'agent-1',
+  })
+  const firstPrepared = await tools.get('workspace_apply').execute({
+    action: 'prepare',
+    leaseId: firstLease.lease.id,
+    files: [{ path: 'a.txt', after: 'a' }],
+  })
+  const firstCommit = await tools.get('workspace_apply').execute({
+    action: 'commit',
+    patchsetId: firstPrepared.patchset.id,
+  })
+  assert.equal(firstCommit.applied, true)
+  assert.equal(await fs.readFile(path.join(root, 'a.txt'), 'utf8'), 'a')
+  assert.equal((await provider.inspect('a.txt')).locked, false)
+
+  // A lock held by another host makes commit fail before any write.
+  const held = await provider.acquire('b.txt', { ttlMs: 5000, owner: 'host-b/agent-2' })
+  const secondLease = await tools.get('workspace_lease').execute({
+    action: 'acquire',
+    workspace: '/repo',
+    paths: ['b.txt'],
+    owner: 'agent-1',
+  })
+  const secondPrepared = await tools.get('workspace_apply').execute({
+    action: 'prepare',
+    leaseId: secondLease.lease.id,
+    files: [{ path: 'b.txt', after: 'b' }],
+  })
+  await assert.rejects(
+    tools.get('workspace_apply').execute({
+      action: 'commit',
+      patchsetId: secondPrepared.patchset.id,
+    }),
+    (error) => {
+      assert.equal(error.code, 'LOCKED')
+      assert.equal(error.details.owner, 'host-b/agent-2')
+      return true
+    },
+  )
+  await assert.rejects(fs.stat(path.join(root, 'b.txt')), { code: 'ENOENT' })
+  await provider.release(held)
 })
 
 test('workspace_rollback without a journal still returns the plan', async (t) => {

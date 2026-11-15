@@ -6,9 +6,9 @@
 
 `dsh-os-quota` adds the missing "resource governor" primitive to a DeepSeek Harness (DSH) deployment: one small ledger per scope (session, agent, team, sandbox — your choice of id), three budgets, and a policy answer to *"may this work start?"* — not just a meter that tells you later what it cost.
 
-- Status: **0.2.0 MVP, published to npm** (name verified free on 2026-11-14).
-- Runtime: pure ESM JavaScript, Node 24+, no build step, no `@deepseek-ai/*` imports in `src/core.js` or `src/enforce.js`.
-- Tests: `node --test` (44 tests, offline, injectable clock, fake event bus).
+- Status: **0.2.1 MVP, published to npm** (name verified free on 2026-11-14).
+- Runtime: pure ESM JavaScript, Node 24+, no build step, no `@deepseek-ai/*` imports in `src/core.js`, `src/enforce.js` or `src/meter.js`.
+- Tests: `node --test` (54 tests, offline, injectable clock, fake event bus).
 
 ## Why
 
@@ -27,6 +27,7 @@ That leaves a gap an agent OS should close:
 3. **Accounting** — `consume()` books actual usage; overage is recorded and surfaced (`overBy`) instead of being hidden or clamped away.
 4. **Isolation** — each scope is an independent ledger; one runaway agent cannot consume another agent's budget.
 5. **Opt-in enforcement** — with `enforce: true`, a `tools/pre-execute` waterfall gate denies hard tool calls, marks soft calls as degraded, and books reported result usage. It is off by default and depends on the host dispatching that hook.
+6. **Opt-in automatic session metering** — with `autoMeter: true`, provider-reported token usage from `assistant/message` / `assistant/attempt` session events is booked automatically, deduped by `sessionId + turn + step + type`.
 
 Admission remains advisory by default: without `enforce`, nothing intercepts a real call. Even with enforcement enabled, this is a **budget gate for tool calls**, not a sandbox or an authorization boundary. It cannot stop an LLM request, a job start or a disk write by itself; it can only deny a tool call that the host routes through `tools/pre-execute`.
 
@@ -48,7 +49,7 @@ Or pack it first:
 ```sh
 cd packages/dsh-os-quota
 npm pack
-dsh plugin --profile quota add ./dsh-os-quota-0.2.0.tgz
+dsh plugin --profile quota add ./dsh-os-quota-0.2.1.tgz
 ```
 
 Once published, the same flow is:
@@ -61,7 +62,7 @@ dsh plugin --profile quota add dsh-os-quota
 
 ## Tools
 
-All five tools return JSON (pretty-printed). `null` in serialized output means **unlimited** (JSON has no `Infinity`).
+All six tools return JSON (pretty-printed). `null` in serialized output means **unlimited** (JSON has no `Infinity`).
 
 | Tool | Parameters | Behavior |
 |---|---|---|
@@ -70,6 +71,7 @@ All five tools return JSON (pretty-printed). `null` in serialized output means *
 | `quota_admit` | `scope`, `tokens?`, `jobs?`, `diskMb?` | Project a spend **without booking it**. Returns `allowed`, `reason`, `level`, `degrade` and remaining budget. `hard` means deny; `soft` is allowed but marked degraded. |
 | `quota_consume` | `scope`, `tokens?`, `jobs?`, `diskMb?` | Book actual usage. Always accumulates; over a hard limit returns `allowed: false` and the overage in `overBy`. |
 | `quota_enforce_status` | `scope?` | Report whether the opt-in pre-execute gate is attached, the adapter policy/counters, the last decision, and current scope ledgers. Read-only and never gated. |
+| `quota_meter_status` | `scope?` | Report whether automatic session metering is attached, the `assistant/message` / `assistant/attempt` event counters, dedupe identity, last booking or skip, and current scope ledgers. Read-only and never gated. |
 
 Example (abridged):
 
@@ -98,7 +100,7 @@ Semantics:
 - Negative, `NaN` and infinite *amounts* book 0. Usage never decreases through `consume`.
 - `resetWindow` is available on the core API and zeroes usage; the tool surface intentionally does not expose a "clear the evidence" operation in the MVP.
 
-The plugin creates one governor per `apply(ctx)`. Optional Cordis config: `limits` (defaults for new scopes), `softRatio`, `windowMs`, `scopes` (seed scopes), `now` (a clock function, useful in tests/embedding), and `enforce` (see below).
+The plugin creates one governor per `apply(ctx)`. Optional Cordis config: `limits` (defaults for new scopes), `softRatio`, `windowMs`, `scopes` (seed scopes), `now` (a clock function, useful in tests/embedding), `enforce` (see below), and `autoMeter` with its optional `scopeOf` resolver (see below).
 
 ## Enforcement (opt-in)
 
@@ -135,21 +137,52 @@ Top-level equivalents: `scope`, `costOf`, `costs` (a convenience name→cost map
 
 `attach(ctx)` uses `ctx.on('tools/pre-execute', handler)` and the result listeners above; if a host has no event bus but exposes `ctx.tools.preExecute(handler)`, that registration seam is used instead. `detach()` removes every listener (idempotent, and safe even if a host returned no disposer). `quota_enforce_status` reports `enabled`, `attached`, `hooks`, `counters`, `last` and the current ledgers.
 
-**What this does not do:** it is not a `token-meter` or `jobs` adapter and does not meter LLM requests, job starts or disk writes automatically. It only gates tool calls that the host actually routes through `tools/pre-execute`, and only books usage that a tool explicitly reports. The built-in `quota_*` tools help an operator inspect and book usage, but they are not a measurement source.
+**What this does not do:** enforcement is not a `token-meter` or `jobs` adapter. It does not meter LLM requests, job starts or disk writes, and only books usage that a tool explicitly reports. Automatic model-token accounting is the separate opt-in `autoMeter` subscription described below. Even with both features on, this is not a sandbox or an authorization boundary.
+
+## Automatic session metering (opt-in)
+
+`autoMeter: true` attaches [`src/meter.js`](./src/meter.js). It subscribes to the durable `session/event` feed and books provider-reported token usage into the scope ledger — no token-meter service, log file or prompt content is read.
+
+```js
+apply(ctx, {
+  autoMeter: true,
+  // Optional: map a session to another ledger. Return a non-empty string.
+  scopeOf: (session) => `session:${session.id}`,
+  limits: { tokens: 200000 },
+})
+```
+
+Only two event types are considered:
+
+| Event | Usage source |
+|---|---|
+| `assistant/message` | `event.data.usage`; the committed message's top-level usage is authoritative |
+| `assistant/attempt` | top-level `usage` when the host provides it, else the last `usage` chunk of the compact provider stream |
+
+For each usable sample:
+
+1. **Charge** — `tokens = usage.totalTokens ?? inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens`. `TokenUsage` buckets are disjoint (cached input is **not** inside `inputTokens`), so the fallback sum is the full call.
+2. **Scope** — `scopeOf(session)` when configured and it returns a non-empty string, else `session.id`. The default is one ledger per session.
+3. **Dedupe** — at most one booking per `sessionId + turn + step + type`, so a re-published event or host replay cannot double-charge.
+4. **Skip** — an event missing usage, a usable token count, its scope, or its turn/step is counted as skipped and never estimated. Bookings are accounting-only: `governor.consume` accumulates even past a hard limit.
+
+`quota_meter_status` reports `enabled`, `attached`, `eventTypes`, `dedupeKey`, `scopeSource`, `counters` (`events`, `assistantEvents`, `consumed`, `duplicates`, `skipped`, `errors`, `tokens`), `sessions`, `last` and the current ledgers. [`attachTokenMeter(ctx, { governor, scopeOf, now })`](./src/meter.js) is exported for embedding; it returns `{ detach, stats }`, where `stats` is a live read-only object (counters update in place).
+
+This is still **accounting, not control**: it reads committed usage events, not token-meter's live context pressure, and it never interrupts or denies a model request. `autoMeter` is off by default. Jobs and disk usage remain caller-reported.
 
 ## Permissions and data
 
-- **Reads** tool-call names, optional cost hints and reported result `usage`; tool arguments only for a `scope` id.
+- **Reads** tool-call names, optional cost hints and reported result `usage`; tool arguments only for a `scope` id. With `autoMeter: true`, it also reads provider-reported `usage` counters from committed `assistant/message` / `assistant/attempt` session events — never prompt content.
 - **Writes** only an in-process, in-memory ledger. No files, no database, no network, no child processes, no session transcript access, no prompt content.
 - **Does not block by default.** With `enforce: false` (default), `quota_admit` is advisory and an agent can ignore it. With `enforce: true`, a hard decision denies the tool call only if the host runs `tools/pre-execute`; it still does not abort an LLM request, kill a job or prevent a disk write. This is not a security boundary.
-- **No automatic metering**: nothing consumes LLM tokens, job starts or disk usage. The result listener books only an explicit `usage.tokens` field in a tool result; otherwise usage is only what a caller reports through `quota_consume`. Token-meter remains the measurement source of truth.
+- **Automatic metering is opt-in and accounting-only**: with `autoMeter: true` it books token usage after a model step settles; it does not subscribe to token-meter pressure and cannot interrupt a request. With `autoMeter: false`, nothing consumes LLM tokens. Jobs and disk are only what a caller reports through `quota_consume`.
 - **Data lifetime**: process lifetime. Restart, profile reload, or a crash drops every ledger. No PII is collected; avoid secrets in scope ids because they may appear in tool output/logs.
 - **Scope ids are unauthenticated strings**. Any client that can call these tools can touch any scope ledger. Do not treat scope isolation as an authorization mechanism.
 
 ## Limitations (MVP)
 
 1. **In-memory ledger only** — no persistence, no restart recovery, no cross-process or multi-host coordination. Two DSH processes keep two independent ledgers.
-2. **Still not wired to `token-meter` or `jobs`** — there is no subscription to token-meter, the jobs registry or the filesystem. LLM token usage, job starts and disk growth are not metered automatically. Consumption happens only when a tool result explicitly carries `usage.tokens` or a caller invokes `quota_consume`; jobs/disk remain caller-reported.
+2. **Still not wired to `token-meter` or `jobs`** — there is no subscription to the token-meter service, the jobs registry or the filesystem, so live context pressure, job starts and disk growth are not metered. `autoMeter` books provider token usage only after a model step settles through `assistant/message` / `assistant/attempt`; it does not interrupt a request. Jobs/disk remain caller-reported.
 3. **Enforcement depends on the host and on estimates** — the gate only runs if the host dispatches `tools/pre-execute` (stock DSH does). It covers tool calls, not model requests or job starts, and only for tools whose cost is non-zero or whose scope is already over budget. Missing or wrong `costOf` values mean under-admission. It is not a sandbox or an authorization boundary.
 4. **No preemption** — one scope cannot evict another scope's jobs to reclaim budget. Degradation is only a flag today.
 5. **Global soft ratio** — one `softRatio` for all scopes in a governor; no per-scope ratios or weighted dimensions.
@@ -179,11 +212,12 @@ cd 04-build/dsh-os-suite
 npm install
 node --check packages/dsh-os-quota/src/core.js
 node --check packages/dsh-os-quota/src/enforce.js
+node --check packages/dsh-os-quota/src/meter.js
 node --check packages/dsh-os-quota/src/index.js
 node --test packages/dsh-os-quota/test/*.test.js
 ```
 
-`src/core.js` has no `@deepseek-ai/*` imports and no I/O, so the core tests need no network, no DSH profile, and no real clock. `src/enforce.js` is equally dependency-free and is unit-tested against a fake event bus (including the waterfall's `next()` contract). `src/index.js` imports `defineTool` from `@deepseek-ai/dsh-tools` and only adapts the core and the enforcement adapter for Cordis.
+`src/core.js` has no `@deepseek-ai/*` imports and no I/O, so the core tests need no network, no DSH profile, and no real clock. `src/enforce.js` and `src/meter.js` are equally dependency-free and are unit-tested against a fake event bus (including the waterfall's `next()` contract and synthetic `session/event` records). `src/index.js` imports `defineTool` from `@deepseek-ai/dsh-tools` and only adapts the core, enforcement adapter and token meter for Cordis.
 
 ## License
 

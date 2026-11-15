@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.1] - 2026-11-15
+
+### Added
+- `dsh-os-trace`: OTLP/JSON import and export (`--format otlp`); still not gRPC/protobuf.
+- `dsh-os-quota`: automatic consumption from `session/event` assistant usage.
+- `dsh-os-eval`: live reads via `ctx.sessionQuery.readSession`.
+- `dsh-os-lease`: pluggable lock provider and cross-host lock guidance.
+
 ## [0.2.0] - 2026-11-15
 
 ### Added

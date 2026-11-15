@@ -3,7 +3,7 @@
 > **Community project. Not affiliated with, sponsored by, or endorsed by DeepSeek.**
 > Apache-2.0. No SLA, no warranty. This is an early MVP.
 
-**Workspace lease intents and multi-file transaction plans for parallel DSH agents.**
+**Workspace lease intents, pluggable locks, and multi-file transaction plans for parallel DSH agents.**
 
 `dsh-os-lease` lets several agents work in one workspace without silently
 overwriting each other. An agent reserves workspace-relative paths with a
@@ -37,7 +37,7 @@ when agents must share one workspace safely.
 
 ## Install
 
-The package is **published as `dsh-os-lease@0.2.0`**. From npm:
+The package is **published as `dsh-os-lease@0.2.1`**. From npm:
 
 ```sh
 npm install
@@ -57,7 +57,8 @@ JavaScript, JSDoc types, no build step).
 
 The plugin registers four tools. Lease and plan logic lives in `src/core.js`
 (no `@deepseek-ai/*` imports); the opt-in filesystem executor lives in
-`src/apply.js`. Both are unit-testable offline.
+`src/apply.js`, and its pluggable lock providers live in `src/lock.js`. All are
+unit-testable offline.
 
 ### Enabling real writes
 
@@ -140,7 +141,8 @@ The same snapshot is available from `manager.status()`.
 `src/apply.js` (published as the `dsh-os-lease/apply` subpath) exports the
 executor for hosts that want the same behavior without the tool layer:
 
-- `applyPatchset(patchset, { root, verifyBefore? })` → journal
+- `applyPatchset(patchset, { root, verifyBefore?, lockProvider?, lockTtlMs?, lockOwner? })`
+  → journal
 - `readJournal(id, { root })` → parsed journal manifest
 - `rollback(journalPathOrJournal, { root? })` → rollback summary
 
@@ -149,7 +151,53 @@ The journal lives at
 `<root>/.dsh-os-lease/journal/<id>/backups/`. The manifest records paths,
 existence, modes, sizes, and SHA-256 hashes, but not file bodies. Failures throw
 `ApplyError` with a stable `code` such as `INVALID_PATH`, `PATH_ESCAPE`,
-`LOCKED`, `ALREADY_APPLIED`, `BACKUP_MISSING`, or `ROLLBACK_FAILED`.
+`LOCKED`, `ALREADY_APPLIED`, `BACKUP_MISSING`, or `ROLLBACK_FAILED`. A `LOCKED`
+error carries `details.owner` and `details.expiresAt` (`null` when the record
+has no expiry) so the caller can decide whether to wait or inspect the holder.
+
+### Lock providers
+
+Before writing, `applyPatchset` takes one lock per normalized path through a
+provider (published as the `dsh-os-lease/lock` subpath):
+
+- `FileLockProvider({ dir })` — one JSON lock file per key, created with
+  `wx`, containing `owner`, `token`, and `expiresAt`. Expired records are
+  reclaimed after `expiresAt`. This is the default, with
+  `dir = <root>/.dsh-os-lease/locks`.
+- `MemoryLockProvider` — same contract in a `Map`; for tests and
+  single-process embedding only. Two instances do not share state.
+- `LockProvider` — the interface (`acquire`, `renew`, `release`, `inspect`) for
+  custom adapters. `withLock(provider, key, fn, { ttlMs?, owner? })` wraps a
+  callback and releases on success and on throw. Redis/SQL/etcd adapters are
+  intentionally not shipped; `docs/cross-host-locks.md` sketches the interface
+  only, with the relevant clock and fencing caveats.
+
+```js
+import { applyPatchset } from 'dsh-os-lease/apply'
+import { FileLockProvider } from 'dsh-os-lease/lock'
+
+const lockProvider = new FileLockProvider({ dir: '/srv/shared/.dsh-os-lease/locks' })
+
+await applyPatchset(patchset, {
+  root: '/srv/shared/workspace',
+  lockProvider,
+  lockTtlMs: 15 * 60 * 1000,
+  lockOwner: 'host-a/agent-7',
+})
+```
+
+The plugin config accepts the same knobs (`lockProvider`, `lockTtlMs`,
+`lockOwner`) when that provider can be constructed by the embedding host.
+
+`FileLockProvider` coordinates processes on one host, and processes on several
+hosts **only when the lock directory is on a shared filesystem (NFS/SMB) that
+honours atomic `O_EXCL` create and rename, with bounded clock skew**. Cross-host
+coordination therefore requires either that shared filesystem or a custom
+`lockProvider` backed by a shared service; the built-in local default does not
+cross hosts. It is a time-based lease: it is **not a strong distributed lock**,
+has no fencing token, and is unsupported on FUSE/cloud-sync mounts. The full
+conditions, clock-skew math, TTL guidance, and Redis/SQL interface sketches are
+in [`docs/cross-host-locks.md`](docs/cross-host-locks.md).
 
 Typical flow:
 
@@ -187,17 +235,27 @@ Typical flow:
   locks on disk survive and can be rolled back or inspected by the next process
   with the same `root`.
 - No credentials, no telemetry, no external storage. The applier has no
-  privileges beyond the DSH process that runs it.
+  privileges beyond the DSH process that runs it. This describes the built-in
+  providers; a custom `lockProvider` is host-supplied code and may talk to
+  whatever backing store it implements (Redis, SQL, a daemon), so review it like
+  any other dependency.
 
 ## Limitations
 
 - **Default is plan-only.** Commit writes nothing unless the plugin config has
   both `apply: true` and `root`. There is no per-call override.
-- **No cross-host lock.** Overlapping applies are excluded with local
-  `fs.open('wx')` lock files under `<root>/.dsh-os-lease/locks/`. This
-  coordinates cooperating processes on the **same host and filesystem**; it is
-  not a distributed lock. A crashed process can leave a stale lock file, which
-  must be removed manually after confirming no apply is still running.
+- **Cross-host locking is opt-in and not a strong distributed lock.**
+  Overlapping applies are excluded by a pluggable provider. The default file
+  provider under `<root>/.dsh-os-lease/locks/` coordinates cooperating
+  processes on the **same host and filesystem**; across hosts it is only
+  plausible when that directory is on a shared NFSv4/SMB 3.x mount with working
+  atomic `O_EXCL` create and rename, coherent directory caching, and clocks
+  whose skew is far below the TTL. It is not linearizable, has no fencing
+  token, and is unsupported on FUSE/cloud-sync mounts. A crashed process leaves
+  a lock until its TTL expires; locks without an `expiresAt` (created by older
+  versions) must be removed manually after confirming no apply is running. Use
+  a custom provider for stronger semantics. See
+  [`docs/cross-host-locks.md`](docs/cross-host-locks.md).
 - **Per-file atomic, not multi-file crash-atomic.** Each file is temp-file +
   fsync + rename, but a crash between files leaves a partially applied tree.
   The journal is marked `applying`; run `rollback(journal)` to restore it.
@@ -210,9 +268,11 @@ Typical flow:
   link rather than its target. Path checks are not atomic against a hostile
   process mutating directories concurrently (TOCTOU); use an OS sandbox for
   adversarial workloads.
-- **In-process leases.** There is no cross-process or cross-host lease view.
-  Two DSH processes do not see each other's leases; the applier locks only
-  protect file application.
+- **In-process leases.** There is no cross-process or cross-host *lease* view.
+  Two DSH processes do not see each other's lease/patchset state; the applier
+  locks coordinate file application only among processes that share the
+  provider's storage (one host by default; a correctly configured shared FS for
+  cross-host use).
 - **No persistence of leases.** Restarting DSH drops all lease and patchset
   state; expired workspaces are reclaimed only as a new process sees them.
 - **Case-sensitive.** Paths differing only by case are distinct. On
@@ -221,7 +281,9 @@ Typical flow:
   literal workspace-relative strings; `..` and absolute paths are rejected.
   Deletion exists only as rollback of files that the journal created.
 - **TTL is clock-based.** The default clock is `Date.now()`; callers may inject
-  a clock for tests. There is no heartbeat/dead-agent detector.
+  a clock for tests. Both lease and lock expiry follow the local clock, and
+  neither has a heartbeat/dead-agent detector; keep clock skew far below the
+  TTL (see [`docs/cross-host-locks.md`](docs/cross-host-locks.md)).
 - **No merge or nested transactions.** A prepared patchset must be committed or
   rolled back before another patchset may touch overlapping paths.
 - **Rollback assumes journaled paths are not edited externally.** It restores
@@ -252,12 +314,17 @@ repository names can be claimed at any time.
 node --test packages/dsh-os-lease/test/*.test.js
 ```
 
-30 tests cover leases (acquire/release, TTL expiry, prefix conflicts, workspace
+51 tests cover leases (acquire/release, TTL expiry, prefix conflicts, workspace
 isolation, lease lifetime at commit), patchset planning (prepare/commit
-sorting, duplicate transitions, prepared-patchset overlap, status counts), and
-the applier (write/read journals, atomic mode-preserving replacement, path and
-symlink escape rejection, rollback restore/delete, idempotent rollback, missing
-backup errors, duplicate journal ids, per-path locks, a concurrent lock race,
+sorting, duplicate transitions, prepared-patchset overlap, status counts), the
+lock layer (acquire/conflict/expiry-reclaim/release/renew/`withLock` on both
+`FileLockProvider` and `MemoryLockProvider`, token-checked stale handles, two
+file providers sharing one directory, legacy lock files without expiry,
+concurrent acquirers, and custom-provider config wiring), and the applier
+(write/read journals, atomic mode-preserving
+replacement, path and symlink escape rejection, rollback restore/delete,
+idempotent rollback, missing backup errors, duplicate journal ids, default and
+injected per-path lock providers with `owner`/`expiresAt` in `LOCKED`,
 `verifyBefore`, and the dry-run/apply/rollback tool wiring).
 
 ## License

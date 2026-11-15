@@ -1,8 +1,10 @@
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { createGovernor } from './core.js'
 import { createEnforcer } from './enforce.js'
+import { attachTokenMeter, METER_DEDUPE_KEY, METER_EVENT_TYPES } from './meter.js'
 
 export { createEnforcer, QuotaDeniedError } from './enforce.js'
+export { attachTokenMeter, METER_DEDUPE_KEY, METER_EVENT_TYPES, tokensOfUsage } from './meter.js'
 
 export const name = 'dsh-os-quota'
 export const inject = ['tools']
@@ -59,9 +61,36 @@ function isRecord(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
+/** Counters reported by `quota_meter_status` before the meter is attached. */
+function emptyMeterCounters() {
+  return { events: 0, assistantEvents: 0, consumed: 0, duplicates: 0, skipped: 0, errors: 0, tokens: 0 }
+}
+
+/**
+ * Read-only meter report for profiles that leave `autoMeter` off. The shape
+ * matches `attachTokenMeter(...).stats` so the status tool never changes shape.
+ * @param {boolean} customScope
+ * @returns {object}
+ */
+function detachedMeterStats(customScope) {
+  return {
+    attached: false,
+    eventTypes: METER_EVENT_TYPES,
+    dedupeKey: METER_DEDUPE_KEY,
+    scopeSource: customScope ? 'scopeOf(session)' : 'session.id',
+    counters: emptyMeterCounters(),
+    sessions: 0,
+    last: null,
+    lastError: null,
+  }
+}
+
 /**
  * Register the four budget tools plus `quota_enforce_status`, and attach the
  * opt-in pre-execute gate when `config.enforce` is true.
+ *
+ * When `config.autoMeter` is true, also subscribe to `session/event` and book
+ * provider-reported usage from `assistant/message` / `assistant/attempt`.
  *
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {object} [config] Optional Cordis plugin config.
@@ -76,6 +105,10 @@ function isRecord(value) {
  *   Opt-in tool-call enforcement. `true` attaches the `tools/pre-execute`
  *   waterfall and the result-usage consumer. Pass an object to configure the
  *   same adapter inline (`enabled` defaults to true in that form).
+ * @param {boolean} [config.autoMeter=false] Opt-in automatic session usage:
+ *   subscribe to `session/event` and consume provider-reported token usage.
+ * @param {(session: object) => string} [config.scopeOf] Optional scope resolver
+ *   for auto-metered sessions; defaults to `session.id`.
  * @param {string | ((call: object) => string)} [config.scope] Scope used by the
  *   enforcement adapter when a call does not name one.
  * @param {Record<string, unknown> | ((name: string, call: object) => unknown)} [config.costOf]
@@ -120,6 +153,12 @@ export function apply(ctx, config = {}) {
     ignore: enforcePolicy.ignore ?? options.enforceIgnore,
     now: options.now,
   })
+
+  const scopeOf = typeof options.scopeOf === 'function' ? options.scopeOf : undefined
+  const autoMeter = options.autoMeter === true
+  const meter = autoMeter
+    ? attachTokenMeter(ctx, { governor, scopeOf, now: options.now })
+    : null
 
   ctx.tools.register(
     defineTool({
@@ -220,12 +259,45 @@ export function apply(ctx, config = {}) {
     }),
   )
 
+  ctx.tools.register(
+    defineTool({
+      name: 'quota_meter_status',
+      description:
+        'Report automatic session-usage metering: whether autoMeter is attached, the events/counters it observed, ' +
+        'how token samples are charged, the last booking or skip, and current scope ledgers. Read-only and ' +
+        'never gated. It reads committed session usage events only; it does not read token-meter pressure or ' +
+        'interrupt a request.',
+      parameters: {
+        scope: { type: 'string', description: 'Optional scope id whose ledger to include as scopeStatus.' },
+      },
+      output,
+      isConcurrencySafe: () => true,
+      async execute(args) {
+        const report = meter === null ? detachedMeterStats(scopeOf !== undefined) : meter.stats
+        return {
+          enabled: autoMeter,
+          autoMeter,
+          ...report,
+          scopes: governor.list(),
+          ...(typeof args.scope === 'string' && args.scope !== ''
+            ? { scopeStatus: governor.status(args.scope) }
+            : {}),
+        }
+      },
+    }),
+  )
+
   if (enforceEnabled) enforcer.attach(ctx)
 
   // Keep apply()'s public return value (the governor) stable while exposing the
-  // adapter for embedding/tests without changing enumerable shape.
+  // adapters for embedding/tests without changing enumerable shape.
   Object.defineProperty(governor, 'enforcer', {
     value: enforcer,
+    enumerable: false,
+    configurable: true,
+  })
+  Object.defineProperty(governor, 'meter', {
+    value: meter,
     enumerable: false,
     configurable: true,
   })

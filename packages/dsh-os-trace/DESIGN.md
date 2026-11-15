@@ -1,6 +1,6 @@
 # DESIGN — dsh-os-trace
 
-> 状态：0.1.2 + 实时采集/HMAC 签名（未发布）。本文描述**已实现的行为**与**明确的未来接线点**，不把计划写成现状。
+> 状态：0.1.2 + 实时采集/HMAC 签名/OTLP JSON 互操作（未发布）。本文描述**已实现的行为**与**明确的未来接线点**，不把计划写成现状。
 
 ## 1. 目标与非目标
 
@@ -9,12 +9,13 @@
 1. **因果可解释**：给定一个事件 id，返回它和祖先/后代组成的 span 子图与边。
 2. **可验证的证据包**：span 进入一条 SHA-256 哈希链；导出 bundle 后，任何单点修改、重排、错误拼接都能定位到第一个坏 span。
 3. **可安全分享**：按字段名递归脱敏，重新封链，使校验针对实际分享的字节。
-4. **零 DSH 依赖的核心**：`src/core.js` 不 import `@deepseek-ai/*`，`node --test` 可离线运行；`ingest.js` / `sign.js` 同样可离线测试。
-5. **可嵌**：插件入口负责 store 创建、种子输入、五个工具注册和实时采集 attach；采集/签名逻辑不写进 `index.js`。
+4. **零 DSH 依赖的核心**：`src/core.js` 不 import `@deepseek-ai/*`，`node --test` 可离线运行；`ingest.js` / `sign.js` / `otlp.js` / `cli.js` 同样可离线测试。
+5. **可嵌**：插件入口负责 store 创建、种子输入、五个工具注册和实时采集 attach；采集/签名/OTLP 映射逻辑不写进 `index.js`。
+6. **可互操作**：把 span 与单个 OTLP/JSON 文档互转，明确字段损失；不引入 OTLP SDK、Collector 或 gRPC/protobuf。
 
 ### 非目标
 
-- 不做 OTel Collector/SDK，不导出 OTLP，不做 W3C trace context 传播。
+- 不做 OTel Collector/SDK，不做 OTLP/gRPC 或 protobuf，不做 W3C trace context 传播；OTLP/JSON 仅做离线导入/导出。
 - 不替代 DSH session 日志、不建全局搜索、不做 UI。
 - 不做 PKI、透明日志、外部时间戳或公钥签名；HMAC 是共享密钥 MAC，不是身份凭证。
 - 不做 SQLite 持久化、跨进程共享、崩溃恢复；实时采集不回放历史 session。
@@ -27,8 +28,10 @@ packages/dsh-os-trace/
   src/core.js   纯逻辑：规范化、哈希链、store、why、bundle、verify
   src/ingest.js 实时采集：事件 → span、配对/去重、terminal 才 ingest
   src/sign.js   HMAC-SHA256 签名/验签（testatum-attest v1 载荷约定）
+  src/otlp.js   OTLP/JSON ↔ span：trace/span id 派生、保留属性、字段损失
+  src/cli.js    离线 CLI：trace_export / trace_import（默认 v1 bundle）
   src/index.js  Cordis 插件：createTraceStore + 5 个 defineTool + 种子输入 + attach
-  test/         core / ingest / sign / index 四组离线测试
+  test/         core / ingest / sign / otlp / cli / index 六组离线测试
 ```
 
 数据流：
@@ -37,13 +40,18 @@ packages/dsh-os-trace/
 DSH events (ctx.on) ──► createIngest ──┐
                                       ├── terminal span ──► createTraceStore.ingest
 JSONL / config.spans ─────────────────┘                         │
+OTLP/JSON ──► fromOtlp ─────────────────────────────────────────┘
+                                                                │
                                                                 ├── query(filter) ──► Span[]
                                                                 ├── why(id, depth) ──► 子图 + edges + missing
                                                                 ├── exportBundle({redact}) ──► bundle（可能重新封链）
+                                                                ├── toOtlp(spans) ──► OTLP/JSON
                                                                 └── verifyBundle(bundle) ──► { ok, firstBad, ... }
                                                                        │
                                                                        └── signBundle(bundle, secret) ──► signature
 ```
+
+`src/cli.js` 只负责参数/文件/退出码：`trace_export` 读取 v1 bundle、OTLP/JSON、span 数组或 JSONL 后输出 v1 bundle（默认）或 OTLP/JSON；`trace_import` 读取 v1 bundle（校验链）或 OTLP/JSON，经 `createTraceStore().ingest()` 重新封链后输出 v1 bundle。
 
 没有模块级可变状态：所有 store 状态在 `createTraceStore()` 闭包里；`verifyBundle` 是纯函数（输入 bundle，输出结果）。
 
@@ -90,6 +98,26 @@ JSONL / config.spans ─────────────────┘     
   - `truncated` 表示还有节点因深度上限未纳入。
 - 深度上限 64，避免一次调用失控；`0` 表示只要 target 本身。
 
+### 3.4 OTLP/JSON 映射
+
+`src/otlp.js` 只处理 OTLP/JSON 的 trace 部分，不依赖 DSH 或 OTel 运行时：
+
+- **traceId**：有 `sessionId` 时取 `sha256(sessionId)` 前 16 字节（32 hex）；没有时取根 span id 的同一哈希。无 `parentId` 的 span 是根，不写 `parentSpanId`。
+- **spanId**：`sha256(id)` 前 8 字节（16 hex）；`parentSpanId` 由 `parentId` 同法派生，因此父子引用于导出后仍然闭合。
+- **时间**：`startTimeUnixNano` / `endTimeUnixNano` 是 `毫秒 × 1e6` 的十进制字符串；没有 `endMs` 时不写 `endTimeUnixNano`。
+- **状态**：`ok` / `running` → `status.code: 1`，`error` → `2`。OTLP 没有 running，故 running 的原值写在保留属性里。
+- **属性**：字符串/布尔/安全整数/浮点分别用 `stringValue` / `boolValue` / `intValue` / `doubleValue`；数组/对象用 `arrayValue` / `kvlistValue`。`null`/`undefined` 不写入。
+- **保留属性**：`dsh.span.id`、`dsh.span.parent_id`、`dsh.span.session_id`、`dsh.span.kind`、`dsh.span.status`、`dsh.span.agent_path` 保存 OTLP 没有的 DSH 字段；导入时从 `attrs` 剔除。用户 attrs 不应使用 `dsh.span.*`。
+- **导入缺省**：没有保留属性时 `id = spanId`、`sessionId = traceId`、`kind = "workflow"`、`name = "unnamed"`、缺失时间取 0；无 end 且 status code 为 0 视为 running，code 2 为 error，其余为 ok。
+- **字段损失**：哈希链/HMAC 签名、DSH kind/agentPath（除非保留属性）、除 `service.name` 外的资源属性、span links/events、W3C traceState、OTLP kind/status.message 都不映射；外部 traceId 也不原样保留（导入后仅作缺省 sessionId，再导出会重新派生）。导入后重新封链，导入得到的 hash 不是来源证据。
+- **不处理**：OTLP/gRPC、protobuf、metrics/logs、OTel SDK/Collector、自动上报、W3C trace context 注入/提取。
+
+```js
+import { toOtlp, fromOtlp } from 'dsh-os-trace/otlp'
+const otlp = toOtlp(store.query(), { serviceName: 'my-dsh' })
+for (const span of fromOtlp(otlp)) store.ingest(span)
+```
+
 ## 4. 集成点（已接线，尽力而为）
 
 `src/ingest.js` 已按下面的契约订阅 `session/event`、`tools/pre-execute`、`tools/post-execute`、`tool/result` 以及 approval/agent/subagent/job/mcp 家族事件。Cordis 没有通配符派发，所以实现同时枚举已知具体事件名，并用 `internal/dispatch` 做未知家族兜底。未知事件忽略，采集失败不阻塞主循环。
@@ -128,6 +156,10 @@ JSONL / config.spans ─────────────────┘     
 | `exportedAt`/`sourceRootHash` 被改 | 未签名时不检测；签名后 HMAC 失配 | 这两个字段不在哈希链里，但在签名载荷里；未签名时不要当证据 |
 | 脱敏漏字段 | 只按 key 名匹配，不改字符串内容 | 上游字段命名要规范；必要时先做值级审查 |
 | 脱敏过度 | `id`/`parentId` 等被替换会破坏引用 | 文档建议不要 redact 结构字段；后续可加保留字段规则 |
+| OTLP/JSON 坏 JSON 或坏外层 | `fromOtlp` 抛 `INVALID_OTLP`；CLI 退出码 2 | 不猜测性修复外层；span 内部缺字段才用默认值 |
+| 外部 OTLP span 无 DSH 元数据 | `id = spanId`、`sessionId = traceId`、`kind = workflow` | 字段损失可见；不要把它当 DSH 因果语义 |
+| OTLP 导入的 hash/signature | 丢弃并由 store 重新封链 | 导入后的 hash 不能证明 OTLP 来源 |
+| OTLP attrs 含 null/自定义 AnyValue | null 不导出；未知 oneof 原样保留 | 跨实现可能丢类型；以 README 映射表为准 |
 | 超大 store | 一次导出/返回全量，可能超上下文 | 后续分片导出、游标查询 |
 | 多 DSH 进程 | 各自独立链，无法互验 | 后续 SQLite/共享存储 + 命名空间 |
 | 重启 | 内存清空 | 后续 JSONL append + fsync；当前需调用方保存 bundle |
@@ -157,7 +189,7 @@ JSONL / config.spans ─────────────────┘     
 ### 第 2 周：持久化与可操作性
 
 - 引入只读 SQLite 索引（`node:sqlite` 或等价方案），按 session/时间/kind 建索引；JSONL 作为原始 append log。
-- 增加 `trace verify <bundle.json>` CLI 或等价离线入口；支持从文件加载 bundle 校验。
+- 增加 `trace verify <bundle.json>` 子命令或等价离线入口；CLI 目前已有 `trace_export` / `trace_import`。
 - 分页/游标查询，避免一次扫描全量。
 - 验收：1 万 span 的 store 查询 P95 可接受；离线校验不依赖 DSH 运行时。
 
@@ -171,7 +203,7 @@ JSONL / config.spans ─────────────────┘     
 
 ### 第 4 周：发布与生态
 
-- 补齐 OTel **导入**（不是实时 OTel 后端）：把 OTLP/JSON 或 OTel span 映射为本模型，明确字段损失。
+- OTLP/JSON 导入/导出（已实现；只做 JSON，不接 OTel SDK/Collector，不走 gRPC/protobuf）。
 - 文档、示例 run、npm `pack` 检查、版本范围复核。
 - 发布 0.1.x 到 npm；收集真实 run 的兼容性反馈。
 - 验收：干净环境 `dsh plugin add` + 五个工具可用；`npm pack --dry-run` 文件清单符合预期；README/DESIGN 无未实现承诺。
@@ -181,5 +213,5 @@ JSONL / config.spans ─────────────────┘     
 - bundle `format: "dsh-os-trace/bundle"`，`version: 1`；不兼容变更必须 bump `version`，并保留旧版 verifier。
 - `verifyBundle` 对未知 `format`/`version` 返回 `ok: false`，不做猜测性解析。
 - `core.js` 的公开函数：`createTraceStore`、`verifyBundle`、`canonicalJson`、`computeSpanHash`、`normalizeSpan`；语义变更按 semver 处理。
-- `ingest.js` 的公开入口：`createIngest`、`CORE_INGEST_EVENTS`、`FAMILY_INGEST_EVENTS`。`sign.js` 的公开入口：`signBundle`、`verifySignedBundle`、`signaturePayload`、`SIGN_ALG`、`SECRET_ENV`。
+- `ingest.js` 的公开入口：`createIngest`、`CORE_INGEST_EVENTS`、`FAMILY_INGEST_EVENTS`。`sign.js` 的公开入口：`signBundle`、`verifySignedBundle`、`signaturePayload`、`SIGN_ALG`、`SECRET_ENV`。`otlp.js` 的公开入口：`toOtlp`、`fromOtlp`、`OTLP_ATTR`、`OTLP_SCOPE_NAME`、`OTLP_DEFAULT_SERVICE_NAME`、`OTLP_SPAN_KIND`；包 `exports` 提供 `./otlp` 与 `./cli` 子路径。
 - 包要求 DSH `>=0.2.2-rc.3 <0.3.0`；DSH 事件 API 变化时，适配器单独发版，不改动已导出的 bundle 格式。

@@ -14,6 +14,14 @@ import { signBundle } from './sign.js'
 
 export { createIngest } from './ingest.js'
 export {
+  OTLP_ATTR,
+  OTLP_DEFAULT_SERVICE_NAME,
+  OTLP_SCOPE_NAME,
+  OTLP_SPAN_KIND,
+  fromOtlp,
+  toOtlp,
+} from './otlp.js'
+export {
   SECRET_ENV,
   SIGN_ALG,
   signBundle,

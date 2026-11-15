@@ -53,7 +53,7 @@ function emit(handlers, event, ...args) {
   for (const handler of [...(handlers.get(event) ?? [])]) handler(...args)
 }
 
-test('registers the four quota tools plus quota_enforce_status', () => {
+test('registers the four quota tools plus quota_enforce_status and quota_meter_status', () => {
   const { ctx, registered } = fakeContext()
   const governor = apply(ctx)
 
@@ -61,12 +61,14 @@ test('registers the four quota tools plus quota_enforce_status', () => {
   assert.deepEqual(inject, ['tools'])
   assert.equal(typeof governor.admit, 'function')
   assert.equal(typeof governor.enforcer.preExecute, 'function')
+  assert.equal(governor.meter, null)
   assert.deepEqual([...registered.keys()], [
     'quota_status',
     'quota_set',
     'quota_admit',
     'quota_consume',
     'quota_enforce_status',
+    'quota_meter_status',
   ])
 
   for (const tool of registered.values()) {
@@ -80,6 +82,7 @@ test('registers the four quota tools plus quota_enforce_status', () => {
   assert.deepEqual(registered.get('quota_admit').parameters.required, ['scope'])
   assert.deepEqual(registered.get('quota_consume').parameters.required, ['scope'])
   assert.equal(registered.get('quota_enforce_status').parameters.required, undefined)
+  assert.equal(registered.get('quota_meter_status').parameters.required, undefined)
 })
 
 test('quota tools share one governor and report ok, soft, hard and overage', async () => {
@@ -152,6 +155,46 @@ test('enforce is off by default: no hooks attached and status reports detached',
   assert.equal(status.attached, false)
   assert.equal(status.hooks.preExecute, false)
   assert.equal(status.counters.preExecute, 0)
+
+  const meter = await registered.get('quota_meter_status').execute({}, {})
+  assert.equal(meter.enabled, false)
+  assert.equal(meter.autoMeter, false)
+  assert.equal(meter.attached, false)
+  assert.equal(meter.counters.consumed, 0)
+  assert.deepEqual(meter.scopes, [])
+})
+
+test('autoMeter:true subscribes to session/event and quota_meter_status reports it', async () => {
+  const { ctx, registered, handlers } = fakeContext()
+  const governor = apply(ctx, { now: 1000, autoMeter: true, limits: { tokens: 100 } })
+
+  assert.equal(typeof governor.meter.detach, 'function')
+  assert.equal(typeof handlers.get('session/event')?.[0], 'function')
+
+  emit(handlers, 'session/event', { id: 'session:auto' }, {
+    type: 'assistant/message',
+    data: { turn: 1, step: 1, usage: { inputTokens: 10, outputTokens: 5 } },
+  })
+  assert.equal(governor.status('session:auto').used.tokens, 15)
+
+  const status = await registered.get('quota_meter_status').execute({ scope: 'session:auto' }, {})
+  assert.equal(status.enabled, true)
+  assert.equal(status.autoMeter, true)
+  assert.equal(status.attached, true)
+  assert.equal(status.eventTypes.length, 2)
+  assert.equal(status.dedupeKey, 'sessionId+turn+step+type')
+  assert.equal(status.counters.consumed, 1)
+  assert.equal(status.counters.tokens, 15)
+  assert.equal(status.scopeStatus.used.tokens, 15)
+  assert.equal(status.scopes.length, 1)
+
+  governor.meter.detach()
+  emit(handlers, 'session/event', { id: 'session:auto' }, {
+    type: 'assistant/message',
+    data: { turn: 2, step: 1, usage: { inputTokens: 10, outputTokens: 5 } },
+  })
+  assert.equal(governor.status('session:auto').used.tokens, 15)
+  assert.equal(governor.meter.stats.attached, false)
 })
 
 test('enforce:true attaches a waterfall that denies hard calls and bypasses quota tools', async () => {

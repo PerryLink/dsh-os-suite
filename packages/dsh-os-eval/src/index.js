@@ -1,5 +1,6 @@
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { createEvalStore } from './core.js'
+import { EvalError, createEvalStore } from './core.js'
+import { readLiveSession } from './live.js'
 import { readSessionFile, summarizeSession, summarizeTrajectory } from './session.js'
 
 export const name = 'dsh-os-eval'
@@ -15,13 +16,18 @@ const output = {
  * @property {import('./core.js').EvalCase[]} [cases] Cases loaded at activation.
  * @property {import('./core.js').Baseline[]} [baselines] Baselines loaded at activation.
  * @property {(evalCase: import('./core.js').EvalCase) => object} [runner] Optional
- *   synchronous host runner. Used only when `eval_run` receives no `sessionFile`;
- *   when neither is present, `eval_run` falls back to its mock argument.
+ *   synchronous host runner. Used only when `eval_run` receives neither
+ *   `liveSessionId` nor `sessionFile`; when neither is present, `eval_run` falls
+ *   back to its mock argument.
  */
 
 /**
  * Register the eval tools. All execution is delegated to the pure store in
  * `core.js`; this module only adapts tool arguments.
+ *
+ * `sessionQuery` is intentionally not a required Cordis injection: the plugin
+ * remains useful without a session-query backend, and a missing service only
+ * fails the `liveSessionId` path with a clear error.
  *
  * @param {import('@deepseek-ai/cordis').Context} ctx Cordis context with `tools`.
  * @param {EvalPluginConfig} [config] Plugin config from the bundle row.
@@ -31,6 +37,8 @@ export function apply(ctx, config = {}) {
   const store = createEvalStore()
   /** @type {Map<string, object>} Latest recorded-session summary per case. */
   const trajectories = new Map()
+  /** @type {Map<string, 'live'|'file'>} Source of the latest recorded session per case. */
+  const sources = new Map()
 
   for (const evalCase of options.cases ?? []) store.defineCase(evalCase)
   for (const baseline of options.baselines ?? []) store.setBaseline(baseline)
@@ -42,9 +50,10 @@ export function apply(ctx, config = {}) {
   ctx.tools.register(defineTool({
     name: 'eval_run',
     description:
-      'Run one eval case from a recorded session JSONL file, an injected host runner, or the '
-      + 'mock fallback, grade it, and record the latest run. Never calls a model; a sessionFile '
-      + 'is read from the one explicit path supplied by the caller.',
+      'Run one eval case from a live session-query session, an exported session JSONL file, an '
+      + 'injected host runner, or the mock fallback, grade it, and record the latest run. Never '
+      + 'calls a model; a session is either read live through ctx.sessionQuery.readSession or from '
+      + 'the one explicit file path supplied by the caller.',
     parameters: {
       caseId: {
         type: 'string',
@@ -59,16 +68,24 @@ export function apply(ctx, config = {}) {
       sessionFile: {
         type: 'string',
         description:
-          'Path to one exported, uncompressed DSH session .jsonl file. Takes precedence over a '
-          + 'host runner and the mock. The final assistant text, paired tool-call count, and '
-          + 'summed usage are graded by the case expectations.',
+          'Path to one exported, uncompressed DSH session .jsonl file. Mutually exclusive with '
+          + 'liveSessionId. Takes precedence over a host runner and the mock. The final assistant '
+          + 'text, paired tool-call count, and summed usage are graded by the case expectations.',
+      },
+      liveSessionId: {
+        type: 'string',
+        description:
+          'Id of a live or persisted DSH session read through ctx.sessionQuery.readSession. '
+          + 'Mutually exclusive with sessionFile. Takes precedence over a host runner and the mock. '
+          + 'When the session-query service is unavailable, the call fails with a clear error '
+          + 'instead of silently falling back.',
       },
       mock: {
         type: 'object',
         additionalProperties: false,
         description:
-          'Mock runner result. Used only when neither sessionFile nor a host runner is present. '
-          + 'Defaults: output echoes the case input, steps/tokens/latencyMs are 0.',
+          'Mock runner result. Used only when neither liveSessionId, sessionFile, nor a host '
+          + 'runner is present. Defaults: output echoes the case input, steps/tokens/latencyMs are 0.',
         properties: {
           output: { type: 'json', description: 'Mock output; defaults to the case input as text.' },
           steps: { type: 'number', description: 'Mock step count.' },
@@ -96,12 +113,28 @@ export function apply(ctx, config = {}) {
     },
     output,
     async execute(args) {
+      if (args.sessionFile !== undefined && args.liveSessionId !== undefined) {
+        throw new EvalError(
+          'CONFLICTING_SESSION_SOURCE',
+          'eval_run accepts either sessionFile or liveSessionId, not both',
+        )
+      }
       if (args.case !== undefined) store.defineCase(args.case)
 
       let run
       let trajectory = null
+      let source = null
+      /** @type {object|null} */
+      let session = null
       if (args.sessionFile !== undefined) {
-        const session = readSessionFile(args.sessionFile)
+        session = readSessionFile(args.sessionFile)
+        source = 'file'
+      } else if (args.liveSessionId !== undefined) {
+        session = await readLiveSession(ctx, args.liveSessionId)
+        source = 'live'
+      }
+
+      if (session !== null) {
         const summary = summarizeSession(session)
         run = store.runCase(args.caseId, () => ({
           output: summary.output,
@@ -111,11 +144,13 @@ export function apply(ctx, config = {}) {
         }))
         trajectory = summarizeTrajectory(session)
         trajectories.set(args.caseId, trajectory)
+        if (source !== null) sources.set(args.caseId, source)
       } else {
         const mock = args.mock ?? {}
         const runner = options.runner ?? ((evalCase) => createMockRun(evalCase, mock))
         run = store.runCase(args.caseId, runner)
         trajectories.delete(args.caseId)
+        sources.delete(args.caseId)
       }
 
       let comparison = null
@@ -127,7 +162,7 @@ export function apply(ctx, config = {}) {
         })
       }
 
-      return { run, comparison, trajectory }
+      return { run, comparison, trajectory, source }
     },
   }))
 
@@ -160,9 +195,9 @@ export function apply(ctx, config = {}) {
   ctx.tools.register(defineTool({
     name: 'eval_report',
     description:
-      'Summarise eval cases and their latest runs as counts, tokens, status, failure reasons, and '
-      + 'compact recorded-trajectory summaries. Never includes raw runner output, tool arguments, '
-      + 'or tool results.',
+      'Summarise eval cases and their latest runs as counts, tokens, status, failure reasons, the '
+      + 'session source (live or file), and compact recorded-trajectory summaries. Never includes '
+      + 'raw runner output, tool arguments, or tool results.',
     parameters: {
       tags: {
         type: 'array',
@@ -173,21 +208,23 @@ export function apply(ctx, config = {}) {
     output,
     async execute(args) {
       const report = store.report(args)
-      return withTrajectorySummaries(report, trajectories)
+      return withTrajectorySummaries(report, trajectories, sources)
     },
   }))
 }
 
 /**
- * Attach the latest recorded-session summary to each report case and aggregate
- * the selected summaries. The aggregate deliberately carries only counts and
- * tool names so `eval_report` remains a summary channel.
+ * Attach the latest recorded-session summary and source to each report case and
+ * aggregate the selected summaries. The aggregate deliberately carries only
+ * counts and tool names so `eval_report` remains a summary channel.
  *
  * @param {{ cases: object[] }} report Store report.
  * @param {Map<string, object>} trajectories Latest trajectory summary per case id.
- * @returns {object} Report extended with per-case and aggregate `trajectory` fields.
+ * @param {Map<string, 'live'|'file'>} sources Latest session source per case id.
+ * @returns {object} Report extended with per-case `source`/`trajectory` and
+ *   aggregate `source`, `sources`, and `trajectory` fields.
  */
-function withTrajectorySummaries(report, trajectories) {
+function withTrajectorySummaries(report, trajectories, sources) {
   const aggregate = {
     sessions: 0,
     turns: 0,
@@ -198,9 +235,14 @@ function withTrajectorySummaries(report, trajectories) {
     toolErrors: 0,
     tools: {},
   }
+  const sourceCounts = { live: 0, file: 0 }
   const cases = report.cases.map((entry) => {
+    const source = sources.get(entry.caseId) ?? null
     const trajectory = trajectories.get(entry.caseId) ?? null
-    if (trajectory === null) return { ...entry, trajectory }
+    if (trajectory === null) return { ...entry, source, trajectory }
+
+    if (source === 'live') sourceCounts.live += 1
+    if (source === 'file') sourceCounts.file += 1
 
     aggregate.sessions += 1
     aggregate.turns += trajectory.turns
@@ -212,10 +254,31 @@ function withTrajectorySummaries(report, trajectories) {
     for (const tool of trajectory.tools) {
       aggregate.tools[tool] = (aggregate.tools[tool] ?? 0) + 1
     }
-    return { ...entry, trajectory }
+    return { ...entry, source, trajectory }
   })
 
-  return { ...report, cases, trajectory: aggregate }
+  return {
+    ...report,
+    source: overallSource(cases),
+    sources: sourceCounts,
+    cases,
+    trajectory: aggregate,
+  }
+}
+
+/**
+ * @param {{ source: 'live'|'file'|null }[]} cases Selected report rows.
+ * @returns {'live'|'file'|'mixed'|null} Shared source, `mixed`, or null when no
+ *   selected case has a recorded session.
+ */
+function overallSource(cases) {
+  const present = new Set()
+  for (const entry of cases) {
+    if (entry.source !== null) present.add(entry.source)
+  }
+  if (present.size === 0) return null
+  if (present.size === 1) return [...present][0]
+  return 'mixed'
 }
 
 /**
