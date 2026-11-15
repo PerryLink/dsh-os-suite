@@ -267,7 +267,11 @@ test('FileLockProvider writes owner/expiresAt and reclaims an expired foreign lo
   const replaced = JSON.parse(await fs.readFile(lockPath, 'utf8'))
   assert.equal(replaced.owner, 'agent-8')
   assert.notEqual(replaced.token, 'stale-token')
-  assert.deepEqual(await fs.readdir(dir), [lockFileName('src/x.js')])
+  assert.deepEqual(
+    (await fs.readdir(dir)).sort(),
+    [lockFileName('src/x.js'), 'fence'].sort(),
+  )
+  assert.equal((await fs.readFile(path.join(dir, 'fence'), 'utf8')).trim(), '2')
   await provider.release(reclaimed)
 })
 
@@ -386,4 +390,116 @@ test('MemoryLockProvider instances do not share locks', async (t) => {
   assert.equal(other.owner, 'agent-2')
   await first.release(handle)
   await second.release(other)
+})
+
+for (const { kind, create } of PROVIDERS) {
+  test(`${kind}: acquire issues monotonic fences and preserves them across renew/release`, async (t) => {
+    const clock = makeClock()
+    const provider = await create(t, clock)
+
+    const first = await provider.acquire('a', { ttlMs: 1000, owner: 'agent-1' })
+    assert.equal(first.fence, 1)
+    const second = await provider.acquire('b', { ttlMs: 1000, owner: 'agent-1' })
+    assert.equal(second.fence, 2)
+    assert.equal((await provider.inspect('a')).fence, 1)
+
+    clock.now = START + 500
+    const renewed = await provider.renew(first, { ttlMs: 5000 })
+    assert.equal(renewed.fence, 1)
+    const released = await provider.release(second)
+    assert.equal(released.fence, 2)
+
+    // Expiry does not reset the counter: the reclaimer gets a newer token.
+    clock.now = START + 5500
+    const reclaimed = await provider.acquire('a', { ttlMs: 1000, owner: 'agent-2' })
+    assert.equal(reclaimed.fence, 3)
+    assert.ok(reclaimed.fence > first.fence)
+    assert.equal(await provider.currentFence(), 3)
+    await provider.release(reclaimed)
+  })
+
+  test(`${kind}: concurrent acquires get distinct fences, and one winner per key`, async (t) => {
+    const clock = makeClock()
+    const provider = await create(t, clock)
+
+    // Distinct keys all succeed; the run must not hand out duplicate tokens.
+    const keys = Array.from({ length: 8 }, (_, index) => `key-${index}`)
+    const handles = await Promise.all(
+      keys.map((key, index) =>
+        provider.acquire(key, { ttlMs: 5000, owner: `agent-${index}` }),
+      ),
+    )
+    const fences = handles.map((handle) => handle.fence).sort((a, b) => a - b)
+    assert.deepEqual(fences, [1, 2, 3, 4, 5, 6, 7, 8])
+    assert.equal(new Set(fences).size, 8)
+    for (const handle of handles) await provider.release(handle)
+
+    // Same key: exactly one acquire wins and it gets the next token.
+    const results = await Promise.allSettled(
+      Array.from({ length: 6 }, (_, index) =>
+        provider.acquire('same', { ttlMs: 5000, owner: `racer-${index}` }),
+      ),
+    )
+    const won = results.filter((result) => result.status === 'fulfilled')
+    const lost = results.filter((result) => result.status === 'rejected')
+    assert.equal(won.length, 1)
+    assert.equal(lost.length, 5)
+    assert.equal(won[0].value.fence, 9)
+    for (const result of lost) assert.equal(result.reason.code, 'LOCKED')
+    await provider.release(won[0].value)
+  })
+}
+
+test('FileLockProvider keeps the fence across instances and honors fencePath', async (t) => {
+  const dir = await makeDir(t)
+  const fencePath = path.join(dir, 'fences', 'counter')
+  const hostA = new FileLockProvider({ dir, fencePath })
+  const hostB = new FileLockProvider({ dir, fencePath })
+
+  const first = await hostA.acquire('x', { owner: 'host-a' })
+  assert.equal(first.fence, 1)
+  assert.equal(hostA.fencePath, fencePath)
+  assert.equal((await fs.readFile(fencePath, 'utf8')).trim(), '1')
+
+  const second = await hostB.acquire('y', { owner: 'host-b' })
+  assert.equal(second.fence, 2)
+  assert.equal(await hostB.currentFence(), 2)
+  await hostA.release(first)
+  await hostB.release(second)
+
+  // `issueFence: false` acquires without consuming a token.
+  const plain = await hostA.acquire('z', { owner: 'host-a', issueFence: false })
+  assert.equal(plain.fence, 2)
+  assert.equal(await hostA.currentFence(), 2)
+  await hostA.release(plain)
+
+  const next = await hostA.acquire('w', { owner: 'host-a' })
+  assert.equal(next.fence, 3)
+  await hostA.release(next)
+})
+
+test('FileLockProvider reclaims a stale fence candidate instead of stalling', async (t) => {
+  const dir = await makeDir(t)
+  await fs.writeFile(path.join(dir, 'fence'), '3\n')
+  const staleCandidate = path.join(dir, 'fence.next-4')
+  await fs.writeFile(staleCandidate, '4\n')
+  const old = new Date(Date.now() - 120_000)
+  await fs.utimes(staleCandidate, old, old)
+
+  const provider = new FileLockProvider({ dir })
+  const handle = await provider.acquire('key', { owner: 'agent-1' })
+  assert.equal(handle.fence, 4)
+  assert.equal((await fs.readFile(path.join(dir, 'fence'), 'utf8')).trim(), '4')
+  await provider.release(handle)
+})
+
+test('FileLockProvider fails closed on a malformed fence file', async (t) => {
+  const dir = await makeDir(t)
+  await fs.writeFile(path.join(dir, 'fence'), 'not-a-number\n')
+  const provider = new FileLockProvider({ dir })
+
+  await assert.rejects(provider.currentFence(), lockCode('FENCE_FAILED'))
+  await assert.rejects(provider.acquire('key', { owner: 'agent-1' }), lockCode('FENCE_FAILED'))
+  // The failed acquire must not leave an unreleasable lock file behind.
+  assert.equal((await provider.inspect('key')).locked, false)
 })

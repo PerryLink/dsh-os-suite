@@ -2,9 +2,11 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { createGovernor } from './core.js'
 import { createEnforcer } from './enforce.js'
 import { attachTokenMeter, METER_DEDUPE_KEY, METER_EVENT_TYPES } from './meter.js'
+import { createPressureGuard } from './pressure.js'
 
 export { createEnforcer, QuotaDeniedError } from './enforce.js'
 export { attachTokenMeter, METER_DEDUPE_KEY, METER_EVENT_TYPES, tokensOfUsage } from './meter.js'
+export { createPressureGuard } from './pressure.js'
 
 export const name = 'dsh-os-quota'
 export const inject = ['tools']
@@ -85,12 +87,55 @@ function detachedMeterStats(customScope) {
   }
 }
 
+/** Counters reported by `quota_pressure_status` before the gate is configured. */
+function emptyPressureCounters() {
+  return {
+    checks: 0,
+    allowed: 0,
+    denied: 0,
+    unavailable: 0,
+    errors: 0,
+    killLists: 0,
+    killRequests: 0,
+    killed: 0,
+    killSkipped: 0,
+    killErrors: 0,
+  }
+}
+
 /**
- * Register the four budget tools plus `quota_enforce_status`, and attach the
- * opt-in pre-execute gate when `config.enforce` is true.
+ * Read-only pressure report for profiles that leave `pressureLimit` unset. The
+ * shape matches `createPressureGuard(...).status()` so the status tool never
+ * changes shape.
+ * @returns {object}
+ */
+function detachedPressureStats() {
+  return {
+    enabled: false,
+    configured: false,
+    attached: false,
+    provider: 'tokenMeter',
+    available: false,
+    jobService: false,
+    maxPressure: null,
+    killJobs: false,
+    counters: emptyPressureCounters(),
+    last: null,
+    lastError: null,
+    pressureTokens: null,
+    killedJobs: [],
+  }
+}
+
+/**
+ * Register the four budget tools and three status tools (`quota_enforce_status`,
+ * `quota_meter_status`, `quota_pressure_status`), and attach the opt-in
+ * pre-execute gates configured by `enforce` and/or `pressureLimit`.
  *
  * When `config.autoMeter` is true, also subscribe to `session/event` and book
  * provider-reported usage from `assistant/message` / `assistant/attempt`.
+ * When `config.pressureLimit` is set, the guard reads token-meter pressure and
+ * can optionally ask the jobs registry to stop running jobs.
  *
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {object} [config] Optional Cordis plugin config.
@@ -122,6 +167,16 @@ function detachedMeterStats(customScope) {
  *   denial object (returning is preferred by the DSH waterfall contract).
  * @param {string[]} [config.enforceIgnore] Additional tool names never gated;
  *   `quota_*` tools are always ignored.
+ * @param {number} [config.pressureLimit] Opt-in context-pressure gate in
+ *   tokens. When set, `ctx.tokenMeter.contextPressure(session).pressureTokens`
+ *   is checked after the governor admission, and a value strictly above this
+ *   limit denies the tool call with `{ kind: 'deny', allow: false,
+ *   reason: 'pressure' }`. The gate attaches even when `enforce` is false; a
+ *   missing token-meter service fails open. `null`/omitted disables it.
+ * @param {boolean} [config.killJobs=false] When true, an over-limit pressure
+ *   check also calls `ctx.jobs.kill(id, session.id, 'quota')` for every job in
+ *   `ctx.jobs.list(session.id)` whose status is exactly `running`. Completed,
+ *   failed, killed and stopping jobs are never touched.
  */
 export function apply(ctx, config = {}) {
   const options = isRecord(config) ? config : {}
@@ -143,6 +198,18 @@ export function apply(ctx, config = {}) {
       ? undefined
       : (toolName) => Object.hasOwn(costs, toolName) ? costs[toolName] : costs['*'])
 
+  const pressureLimit = options.pressureLimit
+  const pressureEnabled = pressureLimit !== undefined && pressureLimit !== null
+  const pressure = pressureEnabled
+    ? createPressureGuard({
+        ctx,
+        governor,
+        maxPressure: pressureLimit,
+        killJobs: options.killJobs,
+        now: options.now,
+      })
+    : null
+
   const enforcer = createEnforcer({
     governor,
     enabled: enforceEnabled,
@@ -151,6 +218,7 @@ export function apply(ctx, config = {}) {
     onDeny: enforcePolicy.onDeny ?? options.onDeny,
     throwOnDeny: enforcePolicy.throwOnDeny ?? options.throwOnDeny,
     ignore: enforcePolicy.ignore ?? options.enforceIgnore,
+    pressure,
     now: options.now,
   })
 
@@ -287,7 +355,34 @@ export function apply(ctx, config = {}) {
     }),
   )
 
-  if (enforceEnabled) enforcer.attach(ctx)
+  ctx.tools.register(
+    defineTool({
+      name: 'quota_pressure_status',
+      description:
+        'Report the opt-in token-meter context-pressure gate: whether it is configured and attached, the ' +
+        'token threshold, whether ctx.tokenMeter/ctx.jobs are available, the observed pressure, denial and ' +
+        'job-kill counters, and the last decision. Read-only and never gated; it does not interrupt an LLM request.',
+      parameters: {
+        scope: { type: 'string', description: 'Optional scope id whose ledger to include as scopeStatus.' },
+      },
+      output,
+      isConcurrencySafe: () => true,
+      async execute(args) {
+        const report = pressure === null ? detachedPressureStats() : pressure.status()
+        const hooks = enforcer.status().hooks
+        return {
+          ...report,
+          attached: pressure !== null && hooks.preExecute,
+          scopes: governor.list(),
+          ...(typeof args.scope === 'string' && args.scope !== ''
+            ? { scopeStatus: governor.status(args.scope) }
+            : {}),
+        }
+      },
+    }),
+  )
+
+  if (enforceEnabled || pressure !== null) enforcer.attach(ctx)
 
   // Keep apply()'s public return value (the governor) stable while exposing the
   // adapters for embedding/tests without changing enumerable shape.
@@ -298,6 +393,11 @@ export function apply(ctx, config = {}) {
   })
   Object.defineProperty(governor, 'meter', {
     value: meter,
+    enumerable: false,
+    configurable: true,
+  })
+  Object.defineProperty(governor, 'pressure', {
+    value: pressure,
     enumerable: false,
     configurable: true,
   })

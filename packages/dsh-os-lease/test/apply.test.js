@@ -7,6 +7,7 @@ import path from 'node:path'
 import {
   ApplyError,
   applyPatchset,
+  assertFence,
   readJournal,
   rollback,
 } from '../src/apply.js'
@@ -46,6 +47,20 @@ async function writeText(root, relative, text) {
 function lockPathFor(root, relative) {
   const hash = createHash('sha256').update(Buffer.from(relative, 'utf8')).digest('hex')
   return path.join(root, '.dsh-os-lease', 'locks', `${hash}.lock`)
+}
+
+/**
+ * The provider `applyPatchset` builds by default, including its root-level
+ * fence file. Tests use it to issue tokens the applier will verify.
+ *
+ * @param {string} root
+ */
+function rootFenceProvider(root) {
+  const state = absolute(root, '.dsh-os-lease')
+  return new FileLockProvider({
+    dir: path.join(state, 'locks'),
+    fencePath: path.join(state, 'fence'),
+  })
 }
 
 /** @param {Promise<unknown>} promise @param {string} code */
@@ -429,7 +444,12 @@ test('applyPatchset accepts a custom lockProvider and releases after the apply',
     { root, lockProvider: provider, lockTtlMs: 4321, lockOwner: 'host-a/agent-1' },
   )
   assert.equal(journal.status, 'applied')
-  assert.deepEqual(calls.at(-1), { key: 'a.txt', ttlMs: 4321, owner: 'host-a/agent-1' })
+  assert.deepEqual(calls.at(-1), {
+    key: 'a.txt',
+    ttlMs: 4321,
+    owner: 'host-a/agent-1',
+    issueFence: true,
+  })
   assert.equal((await provider.inspect('a.txt')).locked, false)
 
   await assertApplyCode(
@@ -518,4 +538,156 @@ test('ApplyError carries a stable name and code', () => {
   assert.equal(error.name, 'ApplyError')
   assert.equal(error.code, 'LOCKED')
   assert.deepEqual(error.details, { path: 'a' })
+})
+
+test('a stale fence is rejected before any write; the current fence succeeds and is journaled', async (t) => {
+  const root = await makeRoot(t)
+  const provider = rootFenceProvider(root)
+  const stale = await provider.acquire('a.txt', { owner: 'old-holder', ttlMs: 60_000 })
+  await provider.release(stale)
+  const fresh = await provider.acquire('a.txt', { owner: 'new-holder', ttlMs: 60_000 })
+  await provider.release(fresh)
+  assert.equal(stale.fence, 1)
+  assert.equal(fresh.fence, 2)
+
+  await assertApplyCode(
+    applyPatchset(
+      { id: 'patch-stale-fence', files: [{ path: 'a.txt', after: 'stale' }] },
+      { root, fence: stale.fence, lockProvider: provider },
+    ),
+    'FENCED',
+  )
+  await assert.rejects(fs.stat(absolute(root, 'a.txt')), { code: 'ENOENT' })
+  await assertApplyCode(readJournal('patch-stale-fence', { root }), 'NOT_FOUND')
+
+  const journal = await applyPatchset(
+    { id: 'patch-fresh-fence', files: [{ path: 'a.txt', after: 'fresh' }] },
+    { root, fence: fresh.fence, lockProvider: provider },
+  )
+  assert.equal(journal.fence, fresh.fence)
+  assert.equal(await readText(root, 'a.txt'), 'fresh')
+  const stored = JSON.parse(await fs.readFile(journal.journalPath, 'utf8'))
+  assert.equal(stored.fence, 2)
+  assert.equal((await readJournal('patch-fresh-fence', { root })).fence, 2)
+})
+
+test('applyPatchset without an explicit fence derives one from its acquisitions and records it', async (t) => {
+  const root = await makeRoot(t)
+  const journal = await applyPatchset(
+    {
+      id: 'patch-derived-fence',
+      files: [
+        { path: 'a.txt', after: 'a' },
+        { path: 'b.txt', after: 'b' },
+      ],
+    },
+    { root },
+  )
+
+  // One token per path lock; the applier uses the last one it acquired.
+  assert.equal(journal.fence, 2)
+  assert.equal(journal.files.every((file) => file.applied), true)
+  const fencePath = absolute(root, path.join('.dsh-os-lease', 'fence'))
+  assert.equal((await fs.readFile(fencePath, 'utf8')).trim(), '2')
+  assert.equal((await readJournal('patch-derived-fence', { root })).fence, 2)
+})
+
+test('the fence is re-checked immediately before every target write', async (t) => {
+  const root = await makeRoot(t)
+  const inner = new MemoryLockProvider()
+  // A newer holder becomes visible after the first target file is written.
+  const provider = {
+    acquire: (key, options) => inner.acquire(key, options),
+    renew: (handle, options) => inner.renew(handle, options),
+    release: (handle) => inner.release(handle),
+    inspect: (key) => inner.inspect(key),
+    async currentFence() {
+      const firstWritten = await fs.stat(absolute(root, 'a.txt')).then(
+        () => true,
+        () => false,
+      )
+      return (await inner.currentFence()) + (firstWritten ? 1 : 0)
+    },
+  }
+
+  await assert.rejects(
+    applyPatchset(
+      {
+        id: 'patch-mid-fence',
+        files: [
+          { path: 'a.txt', after: 'a' },
+          { path: 'b.txt', after: 'b' },
+        ],
+      },
+      { root, lockProvider: provider },
+    ),
+    (error) => {
+      assert.equal(error.name, 'ApplyError')
+      assert.equal(error.code, 'FENCED')
+      assert.equal(error.details.fence, 2)
+      assert.ok(error.details.journalPath)
+      return true
+    },
+  )
+  assert.equal(await readText(root, 'a.txt'), 'a')
+  await assert.rejects(fs.stat(absolute(root, 'b.txt')), { code: 'ENOENT' })
+  const retained = await readJournal('patch-mid-fence', { root })
+  assert.equal(retained.status, 'applyFailed')
+  assert.equal(retained.fence, 2)
+})
+
+test('rollback rejects a stale fence and accepts the current one', async (t) => {
+  const root = await makeRoot(t)
+  await writeText(root, 'a.txt', 'old')
+  const journal = await applyPatchset(
+    {
+      id: 'patch-rollback-fence',
+      files: [
+        { path: 'a.txt', before: 'old', after: 'new' },
+        { path: 'b.txt', after: 'b' },
+      ],
+    },
+    { root },
+  )
+  assert.equal(journal.fence, 2)
+
+  const provider = rootFenceProvider(root)
+  const newer = await provider.acquire('other.txt', { owner: 'newer', ttlMs: 60_000 })
+  await provider.release(newer)
+  assert.equal(newer.fence, 3)
+
+  await assertApplyCode(rollback(journal, { root, fence: journal.fence }), 'FENCED')
+  assert.equal(await readText(root, 'a.txt'), 'new')
+  assert.equal((await readJournal('patch-rollback-fence', { root })).status, 'applied')
+
+  const result = await rollback(journal, { root, fence: newer.fence })
+  assert.equal(result.status, 'rolledBack')
+  assert.equal(await readText(root, 'a.txt'), 'old')
+  await assert.rejects(fs.stat(absolute(root, 'b.txt')), { code: 'ENOENT' })
+})
+
+test('assertFence compares the root fence file and fails closed on a malformed file', async (t) => {
+  const root = await makeRoot(t)
+  // No fence file yet: the counter is 0, so even token 1 is not stale.
+  assert.equal(await assertFence(root, 1), 0)
+
+  const state = absolute(root, '.dsh-os-lease')
+  await fs.mkdir(state, { recursive: true })
+  await fs.writeFile(path.join(state, 'fence'), '4\n')
+  assert.equal(await assertFence(root, 4), 4)
+  assert.equal(await assertFence(root, 5), 4)
+  await assert.rejects(assertFence(root, 3), (error) => {
+    assert.equal(error.name, 'ApplyError')
+    assert.equal(error.code, 'FENCED')
+    assert.equal(error.details.fence, 3)
+    assert.equal(error.details.current, 4)
+    return true
+  })
+
+  await fs.writeFile(path.join(state, 'fence'), 'oops\n')
+  await assert.rejects(assertFence(root, 4), (error) => {
+    assert.equal(error.name, 'ApplyError')
+    assert.equal(error.code, 'FENCE_FAILED')
+    return true
+  })
 })

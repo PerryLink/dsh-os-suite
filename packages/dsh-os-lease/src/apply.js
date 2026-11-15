@@ -24,6 +24,15 @@
  *   custom provider (Redis, SQL, a lock daemon, ...) with `lockProvider` for
  *   other coordination semantics. These are time-based locks, not strong
  *   distributed locks; see `docs/cross-host-locks.md`.
+ * - Every successful acquire also issues a monotonic fencing token. The
+ *   applier records that token in the journal and, before each target write,
+ *   compares it with the provider's current fence (or the root
+ *   `<root>/.dsh-os-lease/fence` file). A token older than the current fence
+ *   means another holder has taken over, so the write is refused with
+ *   `FENCED`. Pass an explicit `fence` when the caller acquired the lock
+ *   itself. The check happens immediately before the write, but the check and
+ *   the write are not atomic: a holder paused between them can still write.
+ *   See §5 of `docs/cross-host-locks.md`.
  *
  * The journal lives at `<root>/.dsh-os-lease/journal/<id>/journal.json`, with
  * pre-images in `<root>/.dsh-os-lease/journal/<id>/backups/`. The manifest
@@ -36,15 +45,19 @@ import path from 'node:path'
 import { normalizePath } from './core.js'
 import {
   DEFAULT_LOCK_TTL_MS,
+  FENCE_FILE_NAME,
   FileLockProvider,
   LockError,
   assertLockProvider,
+  readFenceValue,
 } from './lock.js'
 
 export const STATE_DIRNAME = '.dsh-os-lease'
 export const JOURNAL_DIRNAME = 'journal'
 export const LOCK_DIRNAME = 'locks'
 export const JOURNAL_FILE = 'journal.json'
+/** Fencing counter used by `assertFence` when no provider is supplied. */
+export const FENCE_FILE = FENCE_FILE_NAME
 export const JOURNAL_VERSION = 1
 
 /** Stable machine-readable error codes for filesystem operations. */
@@ -60,6 +73,8 @@ export const APPLY_ERROR_CODES = Object.freeze({
   ALREADY_APPLIED: 'ALREADY_APPLIED',
   LOCKED: 'LOCKED',
   LOCK_FAILED: 'LOCK_FAILED',
+  FENCED: 'FENCED',
+  FENCE_FAILED: 'FENCE_FAILED',
   NOT_FOUND: 'NOT_FOUND',
   JOURNAL_CORRUPT: 'JOURNAL_CORRUPT',
   BACKUP_MISSING: 'BACKUP_MISSING',
@@ -171,8 +186,108 @@ async function resolveRoot(value) {
 }
 
 /**
+ * @param {unknown} value
+ * @param {string} [label]
+ * @returns {number | null}
+ */
+function normalizeFence(value, label = 'fence') {
+  if (value === undefined || value === null) return null
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new ApplyError(
+      APPLY_ERROR_CODES.INVALID_ARGUMENT,
+      `${label} must be a positive safe integer when present`,
+      { fence: value },
+    )
+  }
+  return value
+}
+
+/**
+ * Reject a stale fencing token.
+ *
+ * The current value comes from the lock provider's `currentFence()` when the
+ * provider implements it, otherwise from `options.fencePath`, otherwise from
+ * `<root>/.dsh-os-lease/fence`. A missing fence file means `0`, so an applier
+ * that never issued a token accepts any token. A malformed or unreadable
+ * fence file fails closed with `FENCE_FAILED`.
+ *
+ * This is a compare-then-write check, not an atomic test-and-set: a new token
+ * can appear after the check and before the write. See
+ * `docs/cross-host-locks.md` §5.
+ *
+ * @param {string} root Workspace root.
+ * @param {number} fence Caller's fencing token.
+ * @param {{ provider?: object, fencePath?: string }} [options]
+ * @returns {Promise<number>} The observed current fence.
+ */
+export async function assertFence(root, fence, options = {}) {
+  if (typeof root !== 'string' || root.trim() === '') {
+    throw new ApplyError(APPLY_ERROR_CODES.INVALID_ROOT, 'assertFence root must be a non-empty string')
+  }
+  const expected = normalizeFence(fence, 'fence')
+  if (expected === null) {
+    throw new ApplyError(APPLY_ERROR_CODES.INVALID_ARGUMENT, 'assertFence requires a fence')
+  }
+  if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+    throw new ApplyError(APPLY_ERROR_CODES.INVALID_ARGUMENT, 'assertFence options must be an object')
+  }
+  const provider = options.provider
+  /** @type {string | undefined} */
+  let fencePath
+  let current
+  try {
+    if (
+      provider !== null &&
+      typeof provider === 'object' &&
+      typeof (/** @type {any} */ (provider).currentFence) === 'function'
+    ) {
+      current = await (/** @type {any} */ (provider).currentFence())
+    } else {
+      fencePath =
+        typeof options.fencePath === 'string' && options.fencePath !== ''
+          ? path.resolve(options.fencePath)
+          : path.join(path.resolve(root), STATE_DIRNAME, FENCE_FILE)
+      current = await readFenceValue(fencePath)
+    }
+  } catch (error) {
+    if (error instanceof ApplyError) throw error
+    throw new ApplyError(
+      APPLY_ERROR_CODES.FENCE_FAILED,
+      `cannot verify fence ${expected} under "${root}": ${messageOf(error)}`,
+      {
+        fence: expected,
+        root: path.resolve(root),
+        ...(fencePath === undefined ? {} : { fencePath }),
+        cause: error instanceof LockError ? error.code : undefined,
+      },
+    )
+  }
+  if (!Number.isSafeInteger(current) || current < 0) {
+    throw new ApplyError(
+      APPLY_ERROR_CODES.FENCE_FAILED,
+      `lock provider returned an invalid fence value ${String(current)}`,
+      { fence: expected, current, root: path.resolve(root) },
+    )
+  }
+  if (current > expected) {
+    throw new ApplyError(
+      APPLY_ERROR_CODES.FENCED,
+      `fence ${expected} is stale: the current fence is ${current}; ` +
+        'another holder acquired the workspace after this token was issued',
+      {
+        fence: expected,
+        current,
+        root: path.resolve(root),
+        ...(fencePath === undefined ? {} : { fencePath }),
+      },
+    )
+  }
+  return current
+}
+
+/**
  * @param {unknown} options
- * @returns {{ root: string, verifyBefore: boolean, lockProvider: object | undefined, lockTtlMs: number, lockOwner: string }}
+ * @returns {{ root: string, verifyBefore: boolean, lockProvider: object | undefined, lockTtlMs: number, lockOwner: string, fence: number | null }}
  */
 function normalizeApplyOptions(options) {
   if (options === null || typeof options !== 'object' || Array.isArray(options)) {
@@ -240,6 +355,7 @@ function normalizeApplyOptions(options) {
     lockProvider,
     lockTtlMs,
     lockOwner,
+    fence: normalizeFence(options.fence, 'apply options.fence'),
   }
 }
 
@@ -729,8 +845,10 @@ function resolveBackupPath(root, pathValue, backup) {
  * @param {string} root
  * @param {string} journalDir
  * @param {{ path: string, existed: boolean, mode: number, backup: string | null }} entry
+ * @param {(() => Promise<unknown>) | undefined} [guard] Fence check run
+ *   immediately before each restore write or delete.
  */
-async function restoreEntry(root, journalDir, entry) {
+async function restoreEntry(root, journalDir, entry, guard) {
   const target = resolveTarget(root, entry.path)
   const inspection = await inspectTarget(root, entry.path)
   if (entry.existed) {
@@ -785,6 +903,7 @@ async function restoreEntry(root, journalDir, entry) {
     }
     await ensureParentDirs(root, entry.path, [])
     try {
+      if (guard !== undefined) await guard()
       await writeFileAtomic(target, data, { mode: entry.mode })
     } catch (error) {
       throw new ApplyError(
@@ -805,8 +924,10 @@ async function restoreEntry(root, journalDir, entry) {
     )
   }
   try {
+    if (guard !== undefined) await guard()
     await fs.unlink(target)
   } catch (error) {
+    if (error instanceof ApplyError) throw error
     if (!(error instanceof Error) || error.code !== 'ENOENT') {
       throw new ApplyError(
         APPLY_ERROR_CODES.WRITE_FAILED,
@@ -823,7 +944,7 @@ async function restoreEntry(root, journalDir, entry) {
  * others; the caller decides whether to report an aggregate failure.
  *
  * @param {{ files: Array<any>, createdDirs?: string[] }} manifest
- * @param {{ root: string, journalDir: string }} context
+ * @param {{ root: string, journalDir: string, guard?: () => Promise<unknown> }} context
  * @returns {Promise<Array<{ path: string, code: string, message: string }>>}
  */
 async function restoreEntries(manifest, context) {
@@ -831,7 +952,7 @@ async function restoreEntries(manifest, context) {
   const files = [...manifest.files].reverse()
   for (const entry of files) {
     try {
-      await restoreEntry(context.root, context.journalDir, entry)
+      await restoreEntry(context.root, context.journalDir, entry, context.guard)
       entry.restored = true
       delete entry.error
     } catch (error) {
@@ -938,6 +1059,7 @@ async function preparePlan(input) {
  * @param {string} input.id
  * @param {string} input.root
  * @param {string | null} input.leaseId
+ * @param {number | null} [input.fence]
  * @param {Array<{ entry: any }>} input.plan
  * @param {string[]} input.createdDirs
  */
@@ -949,6 +1071,7 @@ function buildManifest(input) {
     root: input.root,
     patchsetId: input.id,
     leaseId: input.leaseId,
+    fence: input.fence ?? null,
     createdAt: now,
     updatedAt: now,
     status: 'applying',
@@ -970,6 +1093,7 @@ function toManifestRecord(manifest) {
     root: manifest.root,
     patchsetId: manifest.patchsetId,
     leaseId: manifest.leaseId ?? null,
+    fence: manifest.fence ?? null,
     createdAt: manifest.createdAt,
     updatedAt: manifest.updatedAt,
     status: manifest.status,
@@ -1136,18 +1260,23 @@ function toApplyLockError(error, key) {
  * overlap always contend in the same order. On the first failure, handles
  * already acquired by this call are released before the error propagates.
  *
- * @param {{ acquire: (key: string, options: { ttlMs: number, owner: string }) => Promise<any>, release: Function }} provider
+ * @param {{ acquire: (key: string, options: { ttlMs: number, owner: string, issueFence?: boolean }) => Promise<any>, release: Function }} provider
  * @param {string[]} normalizedPaths
- * @param {{ ttlMs: number, owner: string }} options
+ * @param {{ ttlMs: number, owner: string, issueFence?: boolean }} options
  */
 async function acquirePathLocks(provider, normalizedPaths, options) {
   const ordered = [...new Set(normalizedPaths)].sort()
   /** @type {any[]} */
   const acquired = []
+  let fence = null
   try {
     for (const key of ordered) {
       try {
-        acquired.push(await provider.acquire(key, options))
+        const handle = await provider.acquire(key, options)
+        acquired.push(handle)
+        if (Number.isSafeInteger(handle?.fence) && handle.fence > (fence ?? 0)) {
+          fence = handle.fence
+        }
       } catch (error) {
         throw toApplyLockError(error, key)
       }
@@ -1158,6 +1287,7 @@ async function acquirePathLocks(provider, normalizedPaths, options) {
   }
   return {
     paths: ordered,
+    fence,
     release: async () => releasePathLocks(provider, acquired),
   }
 }
@@ -1256,6 +1386,18 @@ function parseJournalValue(value, context) {
       )
     }
     cleanDirs.push(normalized)
+  }
+
+  let fence = null
+  if (manifest.fence !== undefined && manifest.fence !== null) {
+    if (!Number.isSafeInteger(manifest.fence) || manifest.fence < 1) {
+      throw new ApplyError(
+        APPLY_ERROR_CODES.JOURNAL_CORRUPT,
+        `journal "${id}" fence must be a positive safe integer`,
+        { id, fence: manifest.fence },
+      )
+    }
+    fence = manifest.fence
   }
 
   const files = []
@@ -1367,6 +1509,7 @@ function parseJournalValue(value, context) {
     createdAt: typeof manifest.createdAt === 'string' ? manifest.createdAt : null,
     updatedAt: typeof manifest.updatedAt === 'string' ? manifest.updatedAt : null,
     status: manifest.status,
+    fence,
     files,
     createdDirs: cleanDirs,
     ...(typeof manifest.appliedAt === 'string' ? { appliedAt: manifest.appliedAt } : {}),
@@ -1479,8 +1622,17 @@ async function readJournalFile(journalPath, journalDir, options = {}) {
  * second process. Use `lockTtlMs` to tune it and `lockOwner` to make the
  * holder identifiable in `LOCKED` errors (the default is `apply:<pid>`).
  *
+ * Fencing: every successful acquire issues a monotonic token. When the caller
+ * passes `fence` (from a handle it acquired itself), the applier verifies that
+ * token and does not consume a new one for its internal path locks. Without
+ * `fence`, the applier uses the tokens issued by its own acquisitions, so the
+ * journal's `fence` is the last token it holds. Before every target write the
+ * token is compared with the current fence; a newer current value throws
+ * `FENCED`. The journal records the token used (`null` for providers that
+ * issue none).
+ *
  * @param {{ id?: string, leaseId?: string, files: PatchsetInputFile[] } | PatchsetInputFile[]} patchset
- * @param {{ root: string, verifyBefore?: boolean, lockProvider?: object, lockTtlMs?: number, lockOwner?: string }} options
+ * @param {{ root: string, verifyBefore?: boolean, lockProvider?: object, lockTtlMs?: number, lockOwner?: string, fence?: number }} options
  * @returns {Promise<any>} The journal, hydrated with `journalPath` and `dir`.
  */
 export async function applyPatchset(patchset, options) {
@@ -1493,18 +1645,38 @@ export async function applyPatchset(patchset, options) {
   })
   const lockProvider =
     settings.lockProvider ??
-    new FileLockProvider({ dir: path.join(stateDir, LOCK_DIRNAME) })
+    new FileLockProvider({
+      dir: path.join(stateDir, LOCK_DIRNAME),
+      fencePath: path.join(stateDir, FENCE_FILE),
+    })
   const lock = await acquirePathLocks(
     lockProvider,
     normalized.files.map((file) => file.path),
-    { ttlMs: settings.lockTtlMs, owner: settings.lockOwner },
+    {
+      ttlMs: settings.lockTtlMs,
+      owner: settings.lockOwner,
+      // An explicit token belongs to the caller's lease: acquiring path locks
+      // must not advance the counter past it, or the caller's own write would
+      // be rejected.
+      issueFence: settings.fence === null,
+    },
   )
+  const fence = settings.fence ?? lock.fence
+  const guard =
+    fence === null
+      ? undefined
+      : async () => {
+          await assertFence(root, fence, { provider: lockProvider })
+        }
   let journalRoot = null
   let journalDir = null
   let manifest = null
   let manifestWritten = false
   const createdDirs = []
   try {
+    // Fail before creating a journal or touching a target when the caller's
+    // token is already stale.
+    if (guard !== undefined) await guard()
     journalRoot = await ensureDirectory(path.join(stateDir, JOURNAL_DIRNAME), {
       mode: 0o700,
       label: 'journal directory',
@@ -1525,6 +1697,7 @@ export async function applyPatchset(patchset, options) {
       id: normalized.id,
       root,
       leaseId: normalized.leaseId,
+      fence,
       plan,
       createdDirs,
     })
@@ -1534,6 +1707,9 @@ export async function applyPatchset(patchset, options) {
 
     try {
       for (const item of plan) {
+        // Re-check immediately before each write: another holder may have
+        // acquired (and advanced the fence) since the previous file.
+        if (guard !== undefined) await guard()
         try {
           await writeFileAtomic(item.target, item.afterBuffer, { mode: item.entry.mode })
         } catch (error) {
@@ -1558,7 +1734,7 @@ export async function applyPatchset(patchset, options) {
         applied: true,
       }
     } catch (error) {
-      const failures = await restoreEntries(manifest, { root, journalDir })
+      const failures = await restoreEntries(manifest, { root, journalDir, guard })
       if (failures.length === 0) {
         await removeEmptyDirs(root, createdDirs)
         if (journalRoot !== null) {
@@ -1591,12 +1767,17 @@ export async function applyPatchset(patchset, options) {
       } catch {
         // The original message already points at the retained journal.
       }
+      const failedCode =
+        error instanceof ApplyError && error.code === APPLY_ERROR_CODES.FENCED
+          ? APPLY_ERROR_CODES.FENCED
+          : APPLY_ERROR_CODES.WRITE_FAILED
       throw new ApplyError(
-        APPLY_ERROR_CODES.WRITE_FAILED,
+        failedCode,
         `apply failed and automatic recovery failed for ${failures.length} path(s); ` +
           `journal retained at "${journalPath}"`,
         {
           journalPath,
+          fence,
           cause: error instanceof Error ? error.code : undefined,
           failures,
         },
@@ -1776,8 +1957,14 @@ async function locateJournal(reference, options) {
  * no-op, and repeating a partially completed rollback restores from the same
  * backups again. Failures are collected and reported with the journal path.
  *
+ * Passing `fence` turns on fencing: the token is checked with
+ * {@link assertFence} before the journal is marked as rolling back and again
+ * immediately before each restored or deleted file. A stale token throws
+ * `FENCED` and leaves the journal untouched. Without `fence` the previous
+ * behavior (no fencing) is preserved.
+ *
  * @param {string | object} journalPathOrJournal
- * @param {{ root?: string }} [options]
+ * @param {{ root?: string, fence?: number, fencePath?: string }} [options]
  * @returns {Promise<any>}
  */
 export async function rollback(journalPathOrJournal, options = {}) {
@@ -1790,8 +1977,16 @@ export async function rollback(journalPathOrJournal, options = {}) {
   ) {
     throw new ApplyError(APPLY_ERROR_CODES.INVALID_ROOT, 'rollback options.root must be a non-empty string')
   }
+  const fence = normalizeFence(options.fence, 'rollback options.fence')
   const located = await locateJournal(journalPathOrJournal, options)
   const { manifest, root, journalPath, journalDir } = located
+  const guard =
+    fence === null
+      ? undefined
+      : async () => {
+          await assertFence(root, fence, { fencePath: options.fencePath })
+        }
+  if (guard !== undefined) await guard()
 
   if (manifest.status === 'rolledBack') {
     return rollbackResult(manifest, journalPath, root, true)
@@ -1809,7 +2004,7 @@ export async function rollback(journalPathOrJournal, options = {}) {
     )
   }
 
-  const failures = await restoreEntries(manifest, { root, journalDir })
+  const failures = await restoreEntries(manifest, { root, journalDir, guard })
   if (failures.length > 0) {
     manifest.status = 'rollbackFailed'
     manifest.updatedAt = new Date().toISOString()
@@ -1830,7 +2025,7 @@ export async function rollback(journalPathOrJournal, options = {}) {
       APPLY_ERROR_CODES.ROLLBACK_FAILED,
       `rollback of journal "${manifest.id}" failed for ${failures.length} path(s): ` +
         failures.map((failure) => `"${failure.path}" (${failure.code})`).join(', '),
-      { journalPath, failures },
+      { journalPath, fence, failures },
     )
   }
 

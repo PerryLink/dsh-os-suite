@@ -1,10 +1,11 @@
 # dsh-os-eval — design
 
-Status: 0.2.0 (2026-11-15). Pure ESM, no build. Core logic is offline-testable
+Status: 0.2.1 (2026-11-15). Pure ESM, no build. Core logic is offline-testable
 and imports no `@deepseek-ai/*` package. The read-only exported-JSONL adapter
 lives in `src/session.js`; `src/live.js` adds one exact-read call through the
-optional `ctx.sessionQuery.readSession` seam. Both adapters read only the one
-source a caller names.
+optional `ctx.sessionQuery.readSession` seam. `src/watch.js` adds an opt-in
+`session/event` subscription that exists only while a caller keeps it attached.
+Both read adapters read only the one source a caller names.
 
 ## 1. Problem
 
@@ -147,13 +148,24 @@ optional `ctx.sessionQuery.readSession(sessionId)` seam: it converts the
 returned `SessionLogSnapshot` back to the same JSONL shape and grades it with
 the same store. `eval_run` accepts one `sessionFile` path or one
 `liveSessionId` (mutually exclusive); `eval_report` adds a compact trajectory
-summary and the `live`/`file` source. The adapter never subscribes to session
-events, never calls a model, and does not support OTel or compressed logs.
+summary and the `live`/`file` source.
+
+`src/watch.js` is separate from both read adapters and is never used by
+`eval_run`. `createWatcher({ ctx, sessionId })` returns
+`{ attach, detach, snapshot, trajectory }`: attach is the only operation that
+subscribes to `ctx.on('session/event')`, events from other session ids are
+ignored, and detach removes the listener while retaining observed events for the
+life of the watcher. `snapshot()` exposes those events and `trajectory()`
+re-serializes them to the same JSONL shape before calling `trajectoryOf`, so a
+live trajectory cannot drift from a recorded one. Unknown event types are
+tolerated. The exact-read adapters never subscribe at all; the watcher does not
+run automatically, call a model, or persist events.
 
 Trajectory storage is deliberately outside core. This keeps the package free of
 session schemas and makes the data policy simple: summaries in, summaries out.
 Raw messages, tool arguments, and tool results are returned to a programmatic
-`replay` caller but never stored or reported by the plugin.
+`replay` caller — and, for a watched session, retained as raw events in memory —
+but are never persisted or reported by the plugin.
 
 ## 6. Scorers
 
@@ -245,8 +257,28 @@ recorded, not as a fake PASS.
 
 A missing service fails only the `liveSessionId` path, with
 `SESSION_QUERY_UNAVAILABLE`; `sessionFile`, the host runner, and the mock remain
-usable. There is still no event-stream subscription, no query-by-tag, no
-session-root discovery, and no OTel or compressed-log read.
+usable. There is still no query-by-tag, no session-root discovery, and no OTel or
+compressed-log read.
+
+### session/event watcher (implemented in 0.2.1)
+
+`src/watch.js` and the `eval_watch` tool add an opt-in live path:
+
+1. `createWatcher({ ctx, sessionId })` validates the id and registers nothing.
+2. `attach()` calls `ctx.on('session/event', (session, event) => ...)` and keeps
+   only events whose `session.id` equals the configured id. Attach is
+   idempotent; a second call is a no-op.
+3. `snapshot()` returns a shallow copy of retained events. `trajectory()`
+   serializes them to JSONL and reuses `parseSessionJsonl`/`trajectoryOf`, so
+   call/result pairing and unknown-event tolerance match the file adapter.
+4. `detach()` calls the Cordis disposer and keeps the retained history.
+   Re-attaching resumes appending to the same history.
+
+The plugin owns a `Map<sessionId, watcher>` but creates no entry at activation.
+`eval_watch` actions are `attach`, `status`, and `detach`; status rows expose
+only counts and tool names. Plugin disposal detaches every watcher. Watchers are
+not persisted, restored, or evicted automatically, and `eval_run` never consumes
+them.
 
 ### OTel (not implemented)
 
@@ -298,15 +330,16 @@ can be posted as a PR check without parsing prose.
 | Async runner | Core returns before results exist | Explicit `ASYNC_RUNNER_UNSUPPORTED`; use a synchronous adapter. |
 | Mock drift | Gate is green while the real agent regresses | Mock is labelled as a fixture; host runner injection is the production path. |
 | Secret leakage | A case or output appears in logs | Reports omit output; injected runners own persistence; do not put secrets in fixtures. |
-| Unbounded memory | Long-lived process grows | Only the latest run per case is retained; store dies with the process. |
+| Unbounded memory | Long-lived process grows | The store keeps one summary per case and dies with the process; a watcher retains raw events only while attached, so detach long-running watchers. |
 
 ## 10. Security and privacy
 
 - Core has no I/O; the session adapters read only the one `sessionFile` path or
   the one `liveSessionId` a caller names (the latter through the host's
-  `ctx.sessionQuery.readSession`).
+  `ctx.sessionQuery.readSession`). A watcher observes only the one session id
+  given to `createWatcher` and retains raw events in memory only.
 - No raw messages, prompts, tool arguments, or tool results are persisted by this package; reports carry counts, source, tool names, and error counts only.
-- `eval_report` returns status, metrics, reasons, source, and compact trajectory summaries; `eval_run` returns the run object including output to its caller. `evaluateLive` returns raw paired steps only to its programmatic caller.
+- `eval_report` returns status, metrics, reasons, source, and compact trajectory summaries; `eval_run` returns the run object including output to its caller. `evaluateLive` returns raw paired steps only to its programmatic caller. Watcher `snapshot()` and `trajectory()` return raw events and paired steps only to their programmatic caller; `eval_watch` status exposes counts only.
 - Cases are trusted configuration. They are not a sandbox; an injected runner
   runs with host permissions.
 - Baselines contain only pass rate and p50 tokens.

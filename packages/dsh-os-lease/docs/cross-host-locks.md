@@ -1,9 +1,10 @@
 # Cross-host locks in `dsh-os-lease`
 
-Status: design note for the pluggable lock API (`src/lock.js`, `dsh-os-lease@0.2.0`).
+Status: design note for the pluggable lock API (`src/lock.js`, `dsh-os-lease@0.2.1`).
 This document describes what the lock layer can and cannot guarantee when the
 same workspace is mounted on more than one host. It is not a claim of
-linearizability and it is not a substitute for a database transaction.
+linearizability and it is not a substitute for a database transaction. The
+fencing token in §5 is a useful safety net, not a linearizable lock.
 
 ## 1. What the lock layer does
 
@@ -26,18 +27,25 @@ await applyPatchset(patchset, {
 ```
 
 The default provider is a `FileLockProvider` rooted at
-`<root>/.dsh-os-lease/locks`. Every lock has an owner, an expiry, and a random
-token. The token is the capability used by `renew()`/`release()`: an expired
-holder whose lock was reclaimed cannot renew or release the new holder's lock.
+`<root>/.dsh-os-lease/locks`, with the fencing counter at
+`<root>/.dsh-os-lease/fence`. Every lock has an owner, an expiry, a random
+token, and a monotonic **fence**. The token is the capability used by
+`renew()`/`release()`: an expired holder whose lock was reclaimed cannot renew
+or release the new holder's lock. The fence is the write capability recorded in
+the journal and checked before each target write (§5).
 
-This is a **lease**, not a strong distributed lock. Three properties follow from
+This is a **lease**, not a strong distributed lock. Four properties follow from
 that and cannot be configured away:
 
 1. Expiry is evaluated from a local clock, so correctness depends on bounded
    clock skew.
 2. Reclaim is best effort and race-prone by design (see §5).
-3. The filesystem does not enforce fencing. A process paused past its TTL can
-   still write after another process acquired the key.
+3. Fencing is a compare-then-write check, not an atomic test-and-set. It only
+   rejects a writer that has *already observed* a newer fence before it writes.
+   A process paused after its check and before its write can still write. The
+   target filesystem does not enforce the token.
+4. There is no global ordering guarantee. Writes can still interleave, and a
+   crash can leave a partially applied tree plus a retained journal.
 
 ## 2. When cross-host locking is possible
 
@@ -50,10 +58,12 @@ A `FileLockProvider` works across hosts only when **all** of the following hold:
    `open(path, O_CREAT | O_EXCL)` (`fs.open(path, 'wx')`). The call must be
    decided atomically on the server, not by client-side "stat then create".
 3. **Atomic rename in the directory.** Reclaim moves the stale lock file with
-   `rename(2)` inside the same directory; the server must provide atomic
-   rename and coherent directory entries.
-4. **Usable `fsync`.** The provider calls `fsync` on the lock file before it
-   returns a handle. A filesystem that rejects or silently ignores that call
+   `rename(2)` inside the same directory, and the fencing counter is published
+   by renaming a `.next-<n>` candidate over `fence`; the server must provide
+   atomic rename and coherent directory entries.
+4. **Usable `fsync`.** The provider fsyncs the lock file and the published
+   fence before it returns a handle (directory fsync of the fence rename is
+   best effort). A filesystem that rejects or silently ignores those calls
    needs a different provider.
 5. **No hidden caching.** A client must not keep returning cached negative
    lookups or stale file contents after another client created or removed the
@@ -177,10 +187,18 @@ Operational notes:
   only after confirming no apply is running.
 - After a `kill -9`, the lock file remains until its TTL elapses. A retry
   before then gets `LOCKED` with the dead owner's label and expiry.
+- Fence gaps are normal: a failed acquire, a crashed allocator, or a stale
+  `.next-<n>` candidate (reclaimed after 30 s) can skip values. Only monotonic
+  ordering matters, never contiguity.
+- The fence check runs before every target write, so an apply of `n` files
+  reads the counter `n + 1` times. Keep the fence counter on the same coherent
+  mount as the locks; a local counter per host fences nothing.
 - `workspace_status` does not inspect locks; use the provider's `inspect(key)`
   or the embedding API for diagnostics.
 
-## 5. Reclaim race and the absence of fencing
+## 5. Reclaim race and fencing
+
+### Reclaim race
 
 When a lock is expired, the file provider:
 
@@ -194,29 +212,96 @@ probability is small (the window is a few syscalls), but it is not zero. The
 same applies to `release()`: it verifies the token immediately before
 `unlink`, with a small untrusted window.
 
-More fundamentally, no lock in this package is a fencing token at the target
-filesystem. If host A is paused after acquiring, its TTL expires, host B
-reclaims and starts writing, and A resumes, both can write. A lock checks
-cooperating `applyPatchset` callers, not arbitrary editors, NFS clients, or a
-process that never calls the lock API. For workloads where that matters:
+### Fencing tokens
 
-- use a provider backed by a system with a monotonic fencing token (etcd
-  revision, ZooKeeper zxid, a database sequence) and make the write path reject
-  tokens older than the last seen one; the target filesystem must enforce it or
-  the write must go through that system;
-- or serialize writes through a single service/daemon per workspace;
-- or make the operation idempotent and validate from the journal before
-  retrying.
+Reclaim alone cannot stop two writers from writing. Fencing adds a monotonic
+token so the losing writer can be rejected:
 
-`dsh-os-lease` does not implement fencing today.
+- `acquire()` returns `{ fence, owner, expiresAt }` (plus the token and key).
+  `FileLockProvider` stores the counter in `fencePath` (default `<dir>/fence`,
+  default `<root>/.dsh-os-lease/fence` for the applier). It reads the value,
+  adds one, writes a deterministic candidate `fence.next-<n>`, and atomically
+  renames the candidate over `fence`. The `wx` create of the candidate is the
+  serialization point: two allocators may read the same value, but only one can
+  create the next candidate, and a stale reader re-checks the counter before
+  publishing. A token is never issued twice. `MemoryLockProvider` uses an
+  in-process counter with the same monotonic contract.
+- `applyPatchset({ fence })` accepts a token from a lease the caller acquired.
+  It then acquires the path locks with `issueFence: false`, so its internal
+  acquisition does not advance the counter past the caller's token.
+- Before each target write (and before each rollback restore/delete) it calls
+  `assertFence(root, fence)`. If the current fence is greater than the caller's
+  token, the write is refused with `FENCED`. The journal records `fence`.
+- Without an explicit `fence`, the applier uses the token from its own last
+  path-lock acquisition, so ordinary applies are fenced too.
+- `rollback(journal, { fence })` applies the same check; without `fence` it
+  keeps the old unfenced behavior. Rollback has no provider instance, so it
+  reads `<root>/.dsh-os-lease/fence` unless you pass `fencePath` (use that when
+  the provider keeps the counter in a shared lock directory outside the root).
+
+Because the applier takes its own path locks, a caller that acquired the same
+paths must release them before calling `applyPatchset`; otherwise the applier
+reports `LOCKED`. Releasing does not invalidate the caller's fence — the token
+stays valid until another acquire advances the counter.
+
+The check protects against the common failure: host A stalls past its TTL, host
+B reclaims the key and starts an apply, A wakes up and tries to write. A's
+token is older than the fence B published, so A's write is rejected **if A's
+check happens after B's publish**.
+
+### What fencing does not do
+
+The check and the write are separate syscalls. There is no atomic
+"compare-fence-and-write" primitive on a normal filesystem:
+
+1. Holder A calls `assertFence`, sees its own token is current.
+2. A is paused (VM suspend, stop-the-world GC, scheduler starvation, SIGSTOP).
+3. Holder B acquires, publishes a newer fence, and writes.
+4. A resumes and executes the write it had already checked.
+
+A's write lands. Fencing did not prevent it, because no newer fence was visible
+at check time. The same applies between the per-file checks inside one apply.
+Fencing also does not stop a process that ignores the lock API, an editor, an
+NFS client with stale caching, or a filesystem that does not provide atomic
+`wx`/rename. And because the counter is global to the lock directory, any newer
+acquire (even for disjoint paths) makes older tokens stale; expect occasional
+`FENCED` retries when unrelated agents acquire concurrently.
+
+For strong consistency you still need an external authority whose write path is
+atomic with the token check:
+
+- put the writes in a system that can compare the token and apply the write in
+  one transaction (a database row version, etcd compare-and-swap, a lock
+  service that owns the data);
+- or serialize all writes through one daemon/service per workspace;
+- or use a filesystem/object store with native conditional writes
+  (compare-and-swap on a generation number).
+
+A journal makes a retry after `FENCED` safe to inspect, but it does not make
+the write linearizable. `dsh-os-lease` implements the token and the
+compare-then-write guard; it does not implement distributed transactions.
 
 ## 6. Custom providers (interface examples only)
 
 `applyPatchset({ lockProvider })` accepts any object with
 `acquire`/`renew`/`release`/`inspect` methods that throws `LockError`-shaped
-errors (`code`, `details.owner`, `details.expiresAt` for `LOCKED`). This package
-ships only `FileLockProvider` and `MemoryLockProvider`; the Redis and SQL
-adapters below are **not implemented, exported, or tested**. They are
+errors (`code`, `details.owner`, `details.expiresAt` for `LOCKED`). To
+participate in fencing, the provider should also:
+
+- return a monotonic `fence` from `acquire()`;
+- implement `currentFence()`, used by `assertFence` for every write check;
+- accept `issueFence: false` (do not advance the counter) on `acquire`, which
+  the applier passes when the caller supplied its own token. Ignoring the
+  option is safe only when the provider's counter is not shared with the
+  caller's lease.
+
+Without `currentFence()`, `assertFence` falls back to
+`<root>/.dsh-os-lease/fence`, which a custom provider usually does not write;
+fencing then only rejects a token that is older than that file, which is
+usually no fencing at all. Pass `{ fence }` only if the provider can verify it.
+
+This package ships only `FileLockProvider` and `MemoryLockProvider`; the Redis
+and SQL adapters below are **not implemented, exported, or tested**. They are
 documentation sketches that show the shape and the hazards, and they are not
 production adapters.
 
@@ -228,29 +313,42 @@ otherwise. A lock can be lost after a failover; Redlock-style multi-instance
 schemes have known timing assumptions and are still not fencing.
 
 ```js
-// acquire: SET lock:<key> <token> NX PX <ttlMs>
+// acquire: Lua: local fence = redis.call('INCR', 'lockfence:' .. scope)
+//               if SET lock:<key> <json token+owner+fence> NX PX <ttlMs> then
+//                 return fence
+//               else return nil end
 // renew:   Lua: if GET == token then PEXPIRE ttlMs; return 1
 // release: Lua: if GET == token then DEL; return 1
 // inspect: GET + PTTL
+// currentFence: GET lockfence:<scope> (or persist it yourself)
 ```
 
-Store the owner alongside the token (for example a JSON value) if you want
-`LOCKED` errors to name the holder. Always compare the token in Lua; a
-read-then-delete is the same race as the file provider, only faster.
+Store the owner and fence alongside the token (for example a JSON value) if you
+want `LOCKED` errors to name the holder. `INCR` gives a server-side, monotonic
+token without clock skew. Always compare the token in Lua; a read-then-delete
+is the same race as the file provider, only faster. Remember that the fence is
+still only compared by the applier before its write: a Lua script that checks
+the fence *inside* the same script as the data write is what would make the
+write atomic.
 
 ### SQL (PostgreSQL/MySQL)
 
 Use the database clock (`CURRENT_TIMESTAMP`), a unique key, and one statement
 for acquire. For example, with a `locks(lock_key primary key, owner, token,
-expires_at)` table:
+fence, expires_at)` table and a `fence_seq` sequence:
 
 ```sql
-INSERT INTO locks (lock_key, owner, token, expires_at)
-VALUES ($1, $2, $3, now() + ($4 || ' milliseconds')::interval)
+INSERT INTO locks (lock_key, owner, token, fence, expires_at)
+VALUES (
+  $1, $2, $3, nextval('fence_seq'),
+  now() + ($4 || ' milliseconds')::interval
+)
 ON CONFLICT (lock_key) DO UPDATE
   SET owner = EXCLUDED.owner, token = EXCLUDED.token,
+      fence = EXCLUDED.fence,
       expires_at = EXCLUDED.expires_at
-  WHERE locks.expires_at <= now();
+  WHERE locks.expires_at <= now()
+RETURNING fence;
 ```
 
 The `WHERE` on the conflict path is the atomic test-and-set; a zero-row result
@@ -262,12 +360,19 @@ then decide in application code, then write.
 
 Leases plus a monotonic revision/zxid can provide a real fencing token. That is
 outside this package; if you build it, keep the token in the write path rather
-than only in the lock record.
+than only in the lock record. A provider can return the revision as
+`acquire().fence` and implement `currentFence()`; the applier then rejects a
+revision older than the last one it can see. The rejection is still
+compare-then-write unless the data write itself goes through an etcd
+transaction that checks the revision.
 
 ## 7. Deployment checklist
 
 - [ ] Lock directory on a shared NFSv4 or SMB 3.x mount, same server/export and
       same path on every host.
+- [ ] Fencing counter (`<root>/.dsh-os-lease/fence`, or the provider's
+      `fencePath`) on the same coherent mount as the locks; never a per-host
+      local file. Treat a malformed counter as an incident, not as zero.
 - [ ] Not FUSE, not cloud sync, not per-host overlay.
 - [ ] Same UID/group access (or a deliberately shared mode); NFS root squash
       checked.
@@ -275,11 +380,15 @@ than only in the lock record.
 - [ ] `lockTtlMs` longer than the worst-case apply; owner labels include host
       and agent (for example `host-a/agent-7`).
 - [ ] Patchsets are small; long jobs do not hold a lock across pauses.
-- [ ] Retry policy treats `LOCKED` as transient and surfaces `owner` /
-      `expiresAt` to the operator.
+- [ ] Retry policy treats `LOCKED` and `FENCED` as transient, re-acquires (and
+      therefore gets a newer token), and surfaces `owner` / `expiresAt` to the
+      operator.
+- [ ] Callers that acquired their own lease pass its `fence` to
+      `applyPatchset` / `rollback`; a `FENCED` rollback is inspected before
+      retrying with a fresh token.
 - [ ] Journal and backup directories are on the same coherent mount; rollback
-      is not lock-protected, so do not run it concurrently with an apply on
-      overlapping paths.
+      is not lock-protected unless `{ fence }` is supplied, so do not run it
+      concurrently with an apply on overlapping paths.
 - [ ] A single-host integration test and a two-host kill/reclaim test are part
       of the deployment validation.
 
@@ -291,11 +400,14 @@ than only in the lock record.
 | Expiry after crash | Yes, after TTL | Yes, after TTL | Depends on provider |
 | Immune to clock skew | N/A (one clock) | No; keep skew ≪ TTL | Depends; prefer server clock |
 | Linearizable / strong | No | No | Only if the provider is |
-| Fencing against paused writers | No | No | Only if implemented end-to-end |
+| Rejects a write after a newer fence became visible | Yes | Yes | If the provider issues/checks a fence |
+| Prevents a writer paused between check and write | No | No | Only with an atomic compare-and-write store |
 | Works on FUSE/cloud-sync mounts | N/A | No | Not via `FileLockProvider` |
 
 For a single host, the default is appropriate. For multiple hosts on a shared
 filesystem, it is a cooperative lease that prevents the common "two agents edit
-the same multi-file patchset" accident — provided you accept the clock, reclaim,
-and fencing limits above. For anything stronger, implement a provider backed by
-a system that gives you the semantics you need.
+the same multi-file patchset" accident, and the fence usually catches the
+"stalled holder writes late" case. It does **not** prevent a holder that was
+paused after its fence check, and it is not linearizable. For anything stronger,
+implement a provider backed by a system that gives you the semantics you need,
+and put the write behind that system's atomic token check.

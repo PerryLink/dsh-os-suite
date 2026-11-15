@@ -1,6 +1,6 @@
 {
   "name": "dsh-os-catalog",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Intent-based capability catalog for DSH tools, plugins and MCP servers.",
   "type": "module",
   "license": "Apache-2.0",

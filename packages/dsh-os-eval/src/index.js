@@ -2,6 +2,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { EvalError, createEvalStore } from './core.js'
 import { readLiveSession } from './live.js'
 import { readSessionFile, summarizeSession, summarizeTrajectory } from './session.js'
+import { createWatcher } from './watch.js'
 
 export const name = 'dsh-os-eval'
 export const inject = ['tools']
@@ -10,6 +11,8 @@ const output = {
   schema: { type: 'object', additionalProperties: true },
   render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
 }
+
+const WATCH_ACTIONS = new Set(['attach', 'status', 'detach'])
 
 /**
  * @typedef {object} EvalPluginConfig
@@ -39,12 +42,29 @@ export function apply(ctx, config = {}) {
   const trajectories = new Map()
   /** @type {Map<string, 'live'|'file'>} Source of the latest recorded session per case. */
   const sources = new Map()
+  /**
+   * Explicit live watchers, keyed by session id. They are never created at
+   * activation; only the `eval_watch` attach action adds one.
+   *
+   * @type {Map<string, { sessionId: string, watcher: ReturnType<typeof createWatcher>, attached: boolean }>}
+   */
+  const watchers = new Map()
 
   for (const evalCase of options.cases ?? []) store.defineCase(evalCase)
   for (const baseline of options.baselines ?? []) store.setBaseline(baseline)
 
   if (options.runner !== undefined && typeof options.runner !== 'function') {
     throw new TypeError('dsh-os-eval: config.runner must be a synchronous function')
+  }
+
+  // Live watchers are opt-in, but an explicit watcher must not outlive the
+  // plugin that owns its listener. Test doubles without `effect` simply skip
+  // this hook; `detach()` remains available to callers either way.
+  if (typeof ctx.effect === 'function') {
+    ctx.effect(() => () => {
+      for (const entry of watchers.values()) entry.watcher.detach()
+      watchers.clear()
+    })
   }
 
   ctx.tools.register(defineTool({
@@ -167,6 +187,35 @@ export function apply(ctx, config = {}) {
   }))
 
   ctx.tools.register(defineTool({
+    name: 'eval_watch',
+    description:
+      'Attach to, inspect, or detach an explicit live watcher for one DSH session\'s session/event '
+      + 'feed. Attach registers one in-memory listener; status reports observed-event and paired-step '
+      + 'counts; detach stops one or all watchers. Watchers are never created automatically, keep '
+      + 'events only in memory, and are not persisted across plugin restarts.',
+    parameters: {
+      action: {
+        type: 'string',
+        required: true,
+        enum: ['attach', 'status', 'detach'],
+        description:
+          'attach starts watching sessionId; status lists one watcher or all watchers; detach stops '
+          + 'one watcher, or every watcher when sessionId is omitted.',
+      },
+      sessionId: {
+        type: 'string',
+        description:
+          'Target session id. Required for attach. Optional for status and detach: omit it to list '
+          + 'or stop every watcher.',
+      },
+    },
+    output,
+    async execute(args) {
+      return runWatchAction(ctx, watchers, args)
+    },
+  }))
+
+  ctx.tools.register(defineTool({
     name: 'eval_gate',
     description:
       'Evaluate stored eval runs against CI policy and return PASS, WARN, or FAIL with the affected '
@@ -279,6 +328,146 @@ function overallSource(cases) {
   if (present.size === 0) return null
   if (present.size === 1) return [...present][0]
   return 'mixed'
+}
+
+/**
+ * Execute one explicit `eval_watch` action against the plugin-owned watcher
+ * table. No watcher is created during plugin activation; `attach` is the only
+ * action that subscribes.
+ *
+ * @param {object} ctx Cordis context carrying `on`.
+ * @param {Map<string, { sessionId: string, watcher: ReturnType<typeof createWatcher>, attached: boolean }>} watchers
+ *   Watchers owned by this plugin instance.
+ * @param {{ action?: string, sessionId?: string }} args Tool arguments.
+ * @returns {{
+ *   action: 'attach'|'status'|'detach',
+ *   watchers: object[],
+ * }} Action plus one compact row per targeted watcher.
+ * @throws {EvalError} `INVALID_ACTION` for an unknown action, `INVALID_SESSION_ID`
+ *   for a missing attach id or a malformed target id, or the watcher's own
+ *   subscription failure.
+ */
+function runWatchAction(ctx, watchers, args) {
+  const input = args ?? {}
+  const action = input.action
+  if (!WATCH_ACTIONS.has(action)) {
+    throw new EvalError(
+      'INVALID_ACTION',
+      'eval_watch action must be "attach", "status", or "detach"',
+    )
+  }
+
+  if (action === 'attach') {
+    const sessionId = requireWatchSessionId(input.sessionId)
+    let entry = watchers.get(sessionId)
+    if (entry === undefined) {
+      const watcher = createWatcher({ ctx, sessionId })
+      watcher.attach()
+      entry = { sessionId, watcher, attached: true }
+      watchers.set(sessionId, entry)
+    }
+    return { action, watchers: [watcherStatus(entry)] }
+  }
+
+  if (input.sessionId !== undefined) {
+    const sessionId = requireWatchSessionId(input.sessionId)
+    const entry = watchers.get(sessionId)
+    if (entry === undefined) {
+      return { action, watchers: [emptyWatcherStatus(sessionId)] }
+    }
+    if (action === 'status') {
+      return { action, watchers: [watcherStatus(entry)] }
+    }
+
+    // Detach first, then count the retained history for the final row; the
+    // watcher is no longer addressable after the map delete.
+    entry.watcher.detach()
+    const final = watcherStatus(entry, false)
+    watchers.delete(sessionId)
+    return { action, watchers: [final] }
+  }
+
+  if (action === 'status') {
+    return {
+      action,
+      watchers: [...watchers.values()].map((entry) => watcherStatus(entry)),
+    }
+  }
+
+  // detach without a sessionId is the explicit "stop everything" action.
+  const detached = []
+  for (const entry of watchers.values()) {
+    entry.watcher.detach()
+    detached.push(watcherStatus(entry, false))
+  }
+  watchers.clear()
+  return { action, watchers: detached }
+}
+
+/**
+ * Compact, privacy-preserving state for one watcher row. Raw events, tool
+ * arguments, and tool results never leave the tool through this shape.
+ *
+ * @param {{ sessionId: string, watcher: ReturnType<typeof createWatcher>, attached: boolean }} entry
+ *   Watcher table entry.
+ * @param {boolean} [attached] Override for an entry being detached.
+ * @returns {{
+ *   sessionId: string,
+ *   attached: boolean,
+ *   events: number,
+ *   steps: number,
+ *   paired: number,
+ *   toolErrors: number,
+ *   tools: string[],
+ * }} Counts and tool names only.
+ */
+function watcherStatus(entry, attached = entry.attached) {
+  const steps = entry.watcher.trajectory()
+  /** @type {string[]} */
+  const tools = []
+  for (const step of steps) {
+    if (!tools.includes(step.tool)) tools.push(step.tool)
+  }
+  return {
+    sessionId: entry.sessionId,
+    attached,
+    events: entry.watcher.snapshot().length,
+    steps: steps.length,
+    paired: steps.filter((step) => step.hasResult).length,
+    toolErrors: steps.filter((step) => step.isError === true).length,
+    tools,
+  }
+}
+
+/**
+ * @param {string} sessionId Session id with no active watcher.
+ * @returns {object} Zeroed watcher row with `attached: false`.
+ */
+function emptyWatcherStatus(sessionId) {
+  return {
+    sessionId,
+    attached: false,
+    events: 0,
+    steps: 0,
+    paired: 0,
+    toolErrors: 0,
+    tools: [],
+  }
+}
+
+/**
+ * @param {unknown} value Candidate watcher session id.
+ * @returns {string} The validated id.
+ * @throws {EvalError} `INVALID_SESSION_ID` when the value is not a non-empty string.
+ */
+function requireWatchSessionId(value) {
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new EvalError(
+      'INVALID_SESSION_ID',
+      'eval_watch requires a non-empty sessionId for attach, or to target one watcher',
+    )
+  }
+  return value
 }
 
 /**

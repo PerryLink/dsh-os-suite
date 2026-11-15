@@ -10,6 +10,12 @@
  * `dsh.span.*` attribute namespace for the fields OTLP has no equivalent for
  * (the original id, DSH kind/status and agent path). Foreign OTLP spans are
  * mapped with conservative defaults; see README.md for the field-loss list.
+ *
+ * W3C `traceparent` strings are supported as plain span attributes (and as the
+ * optional reserved `dsh.traceparent` attribute): export preserves a valid
+ * `traceparent` attribute and uses its ids/flags, import parses it back into
+ * traceId/spanId and resolves parentSpanId. This is header-string interop only,
+ * not W3C trace context propagation.
  */
 
 import { createHash } from 'node:crypto'
@@ -19,6 +25,7 @@ import {
   TraceError,
   normalizeSpan,
 } from './core.js'
+import { formatTraceparent, parseTraceparent } from './w3c.js'
 
 /** Scope name emitted in every exported OTLP document. */
 export const OTLP_SCOPE_NAME = 'dsh-os-trace'
@@ -38,6 +45,7 @@ export const OTLP_ATTR = Object.freeze({
   kind: 'dsh.span.kind',
   status: 'dsh.span.status',
   agentPath: 'dsh.span.agent_path',
+  traceparent: 'dsh.traceparent',
 })
 
 const RESERVED_ATTR_KEYS = new Set(Object.values(OTLP_ATTR))
@@ -286,6 +294,41 @@ function stringAttr(attrs, key) {
 }
 
 /**
+ * Read the W3C context carried by one span's attributes.
+ *
+ * The reserved `dsh.traceparent` attribute (written when exporting with
+ * `{ traceparent: true }`) wins over a plain `traceparent` attribute. Invalid
+ * values are ignored and stay in `attrs` as opaque user data.
+ *
+ * @param {Record<string, unknown>} attrs
+ * @returns {ReturnType<typeof parseTraceparent>}
+ */
+function traceparentOf(attrs) {
+  for (const key of [OTLP_ATTR.traceparent, 'traceparent']) {
+    const value = attrs[key]
+    if (typeof value !== 'string') continue
+    const parsed = parseTraceparent(value)
+    if (parsed !== null) return parsed
+  }
+  return null
+}
+
+/**
+ * @param {{ span: Record<string, unknown>, id: string }[]} entries
+ * @returns {Map<string, NonNullable<ReturnType<typeof parseTraceparent>>>}
+ */
+function traceparentContexts(entries) {
+  /** @type {Map<string, NonNullable<ReturnType<typeof parseTraceparent>>>} */
+  const contexts = new Map()
+  for (const entry of entries) {
+    if (!isRecord(entry.span.attrs)) continue
+    const parsed = traceparentOf(entry.span.attrs)
+    if (parsed !== null) contexts.set(entry.id, parsed)
+  }
+  return contexts
+}
+
+/**
  * @param {Record<string, unknown>} status
  * @returns {number}
  */
@@ -343,9 +386,10 @@ function traceIdOf(span, byId) {
 /**
  * @param {Record<string, unknown>} span
  * @param {string} id
+ * @param {string} [traceparent] Canonical header for the optional reserved attr.
  * @returns {{ key: string, value: { stringValue: string } }[]}
  */
-function metadataAttributes(span, id) {
+function metadataAttributes(span, id, traceparent) {
   /** @type {{ key: string, value: { stringValue: string } }[]} */
   const attributes = [{ key: OTLP_ATTR.id, value: { stringValue: id } }]
   const parentId = optionalString(span.parentId)
@@ -367,25 +411,31 @@ function metadataAttributes(span, id) {
   if (typeof span.agentPath === 'string') {
     attributes.push({ key: OTLP_ATTR.agentPath, value: { stringValue: span.agentPath } })
   }
+  if (traceparent !== undefined) {
+    attributes.push({ key: OTLP_ATTR.traceparent, value: { stringValue: traceparent } })
+  }
   return attributes
 }
 
 /**
  * @param {Record<string, unknown>} span
  * @param {string} id
+ * @param {string} [traceparent] Canonical header for the optional reserved attr.
  * @returns {{ key: string, value: Record<string, unknown> }[]}
  */
-function spanAttributes(span, id) {
+function spanAttributes(span, id, traceparent) {
   /** @type {{ key: string, value: Record<string, unknown> }[]} */
   const attributes = []
   if (isRecord(span.attrs)) {
     for (const [key, value] of Object.entries(span.attrs)) {
       if (key.length === 0) continue
+      // Managed metadata is (re)generated below, never copied from user attrs.
+      if (key === OTLP_ATTR.traceparent) continue
       const encoded = anyValue(value)
       if (encoded !== undefined) attributes.push({ key, value: encoded })
     }
   }
-  attributes.push(...metadataAttributes(span, id))
+  attributes.push(...metadataAttributes(span, id, traceparent))
   return attributes
 }
 
@@ -393,22 +443,35 @@ function spanAttributes(span, id) {
  * @param {Record<string, unknown>} span
  * @param {string} id
  * @param {Map<string, Record<string, unknown>>} byId
+ * @param {Map<string, NonNullable<ReturnType<typeof parseTraceparent>>>} contexts
+ * @param {boolean} withTraceparent Add the reserved `dsh.traceparent` attribute.
  * @returns {Record<string, unknown>}
  */
-function toOtlpSpan(span, id, byId) {
+function toOtlpSpan(span, id, byId, contexts, withTraceparent) {
   const startMs = typeof span.startMs === 'number' && Number.isFinite(span.startMs) ? span.startMs : 0
   const parentId = optionalString(span.parentId)
   const status = span.status === 'error' ? 2 : 1
+  const context = contexts.get(id)
+  const parentContext = parentId === undefined ? undefined : contexts.get(parentId)
+  const traceId = context?.traceId ?? traceIdOf(span, byId)
+  const spanId = context?.spanId ?? deriveId(id, 8)
+  const traceparent =
+    withTraceparent === true
+      ? formatTraceparent({ traceId, spanId, flags: context?.flags ?? 1 })
+      : undefined
   const otlpSpan = {
-    traceId: traceIdOf(span, byId),
-    spanId: deriveId(id, 8),
+    traceId,
+    spanId,
     name: optionalString(span.name) ?? id,
     kind: OTLP_SPAN_KIND,
     startTimeUnixNano: msToNanos(startMs),
     status: { code: status },
-    attributes: spanAttributes(span, id),
+    attributes: spanAttributes(span, id, traceparent),
   }
-  if (parentId !== undefined) otlpSpan.parentSpanId = deriveId(parentId, 8)
+  if (context !== undefined) otlpSpan.flags = context.flags
+  if (parentId !== undefined) {
+    otlpSpan.parentSpanId = parentContext?.spanId ?? deriveId(parentId, 8)
+  }
   const endMs = typeof span.endMs === 'number' && Number.isFinite(span.endMs) ? span.endMs : undefined
   if (endMs !== undefined && endMs >= startMs) {
     otlpSpan.endTimeUnixNano = msToNanos(endMs)
@@ -419,8 +482,14 @@ function toOtlpSpan(span, id, byId) {
 /**
  * Export DSH spans as an OTLP/JSON trace document.
  *
+ * A valid `attrs.traceparent` W3C header is preserved as an attribute and is
+ * authoritative for that span's `traceId`/`spanId`/`flags`; the parent span's
+ * header id is used for `parentSpanId` when available. With
+ * `{ traceparent: true }`, a canonical `dsh.traceparent` reserved attribute is
+ * added to every span as well.
+ *
  * @param {unknown[]} spans Span inputs or stored spans. `hash`/`prevHash` are ignored.
- * @param {{ serviceName?: string }} [options]
+ * @param {{ serviceName?: string, traceparent?: boolean }} [options]
  * @returns {{
  *   resourceSpans: [{
  *     resource: { attributes: [{ key: 'service.name', value: { stringValue: string } }] },
@@ -442,6 +511,9 @@ export function toOtlp(spans, options = {}) {
     options.serviceName === undefined ? OTLP_DEFAULT_SERVICE_NAME : options.serviceName
   if (typeof serviceName !== 'string' || serviceName.trim().length === 0) {
     throw new TraceError('INVALID_OTLP', 'toOtlp serviceName must be a non-empty string')
+  }
+  if (options.traceparent !== undefined && typeof options.traceparent !== 'boolean') {
+    throw new TraceError('INVALID_OTLP', 'toOtlp traceparent must be a boolean')
   }
 
   /** @type {Map<string, Record<string, unknown>>} */
@@ -467,6 +539,9 @@ export function toOtlp(spans, options = {}) {
     byId.set(id, span)
   }
 
+  /** @type {Map<string, NonNullable<ReturnType<typeof parseTraceparent>>>} */
+  const contexts = traceparentContexts(entries)
+
   return {
     resourceSpans: [
       {
@@ -478,7 +553,15 @@ export function toOtlp(spans, options = {}) {
         scopeSpans: [
           {
             scope: { name: OTLP_SCOPE_NAME },
-            spans: entries.map((entry) => toOtlpSpan(entry.span, entry.id, byId)),
+            spans: entries.map((entry) =>
+              toOtlpSpan(
+                entry.span,
+                entry.id,
+                byId,
+                contexts,
+                options.traceparent === true,
+              ),
+            ),
           },
         ],
       },
@@ -489,11 +572,19 @@ export function toOtlp(spans, options = {}) {
 /**
  * Decode one OTLP span into an intermediate record.
  *
+ * A valid W3C `traceparent` span attribute (plain `traceparent` or the reserved
+ * `dsh.traceparent`) is treated as the span's own context: its trace-id and
+ * parent-id/span-id win over the top-level OTLP ids. `traceparent` carries no
+ * parent id, so `parentSpanId` still comes from OTLP (or is resolved later from
+ * the parent's header when the causal parent is known).
+ *
  * @param {Record<string, unknown>} span
  * @param {number} index
  * @returns {{
  *   id: string,
  *   otlpSpanId?: string,
+ *   rawSpanId?: string,
+ *   headerSpanId?: string,
  *   parentId?: string,
  *   parentSpanId?: string,
  *   sessionId: string,
@@ -514,11 +605,13 @@ function decodeOtlpSpan(span, index) {
   const metaKind = stringAttr(attrs, OTLP_ATTR.kind)
   const metaStatus = stringAttr(attrs, OTLP_ATTR.status)
   const metaAgentPath = attrs[OTLP_ATTR.agentPath]
+  const context = traceparentOf(attrs)
 
   for (const key of RESERVED_ATTR_KEYS) delete attrs[key]
 
-  const otlpSpanId = otlpId(span.spanId)
-  const traceId = otlpId(span.traceId)
+  const rawSpanId = otlpId(span.spanId)
+  const otlpSpanId = context?.spanId ?? rawSpanId
+  const traceId = context?.traceId ?? otlpId(span.traceId)
   const parentSpanId = otlpId(span.parentSpanId)
   const id = metaId ?? otlpSpanId ?? `otlp-${index + 1}`
   const sessionId = metaSessionId ?? traceId ?? 'otlp'
@@ -548,6 +641,8 @@ function decodeOtlpSpan(span, index) {
   return {
     id,
     ...(otlpSpanId !== undefined ? { otlpSpanId } : {}),
+    ...(rawSpanId !== undefined ? { rawSpanId } : {}),
+    ...(context !== null ? { headerSpanId: context.spanId } : {}),
     ...(metaParentId !== undefined ? { parentId: metaParentId } : {}),
     ...(parentSpanId !== undefined ? { parentSpanId } : {}),
     sessionId,
@@ -566,8 +661,11 @@ function decodeOtlpSpan(span, index) {
  *
  * Accepts the full `{ resourceSpans: [...] }` document or a raw OTLP span
  * array. Missing fields are defaulted rather than rejected, and unknown span
- * attributes are kept in `attrs`. The returned spans have no `hash`/`prevHash`;
- * `createTraceStore().ingest()` seals them into this package's chain.
+ * attributes are kept in `attrs`. A valid `traceparent` (or `dsh.traceparent`)
+ * attribute supplies the span's traceId/spanId, and the causal parent's header
+ * id fills parentSpanId when it is otherwise unknown. The returned spans have
+ * no `hash`/`prevHash`; `createTraceStore().ingest()` seals them into this
+ * package's chain.
  *
  * @param {unknown} json OTLP object or JSON text.
  * @returns {import('./core.js').SpanInput[]}
@@ -614,11 +712,28 @@ export function fromOtlp(json) {
     decoded.push(decodeOtlpSpan(span, index))
   }
 
+  /** @type {Map<string, ReturnType<typeof decodeOtlpSpan>>} */
+  const byDecodedId = new Map()
+  for (const entry of decoded) {
+    if (!byDecodedId.has(entry.id)) byDecodedId.set(entry.id, entry)
+  }
+  for (const entry of decoded) {
+    if (entry.parentSpanId !== undefined || entry.parentId === undefined) continue
+    const parent = byDecodedId.get(entry.parentId)
+    if (parent?.headerSpanId !== undefined) {
+      // traceparent itself has no parent field; fill the OTLP-equivalent id
+      // from the causal parent's header when both are known.
+      entry.parentSpanId = parent.headerSpanId
+    }
+  }
+
   /** @type {Map<string, string>} */
   const byOtlpSpanId = new Map()
   for (const entry of decoded) {
-    if (entry.otlpSpanId !== undefined && !byOtlpSpanId.has(entry.otlpSpanId)) {
-      byOtlpSpanId.set(entry.otlpSpanId, entry.id)
+    for (const otlpSpanId of [entry.otlpSpanId, entry.rawSpanId]) {
+      if (otlpSpanId !== undefined && !byOtlpSpanId.has(otlpSpanId)) {
+        byOtlpSpanId.set(otlpSpanId, entry.id)
+      }
     }
   }
 

@@ -53,7 +53,7 @@ function emit(handlers, event, ...args) {
   for (const handler of [...(handlers.get(event) ?? [])]) handler(...args)
 }
 
-test('registers the four quota tools plus quota_enforce_status and quota_meter_status', () => {
+test('registers the four quota tools plus the three status tools', async () => {
   const { ctx, registered } = fakeContext()
   const governor = apply(ctx)
 
@@ -62,6 +62,7 @@ test('registers the four quota tools plus quota_enforce_status and quota_meter_s
   assert.equal(typeof governor.admit, 'function')
   assert.equal(typeof governor.enforcer.preExecute, 'function')
   assert.equal(governor.meter, null)
+  assert.equal(governor.pressure, null)
   assert.deepEqual([...registered.keys()], [
     'quota_status',
     'quota_set',
@@ -69,6 +70,7 @@ test('registers the four quota tools plus quota_enforce_status and quota_meter_s
     'quota_consume',
     'quota_enforce_status',
     'quota_meter_status',
+    'quota_pressure_status',
   ])
 
   for (const tool of registered.values()) {
@@ -83,6 +85,27 @@ test('registers the four quota tools plus quota_enforce_status and quota_meter_s
   assert.deepEqual(registered.get('quota_consume').parameters.required, ['scope'])
   assert.equal(registered.get('quota_enforce_status').parameters.required, undefined)
   assert.equal(registered.get('quota_meter_status').parameters.required, undefined)
+  assert.equal(registered.get('quota_pressure_status').parameters.required, undefined)
+
+  const pressure = await registered.get('quota_pressure_status').execute({}, {})
+  assert.equal(pressure.enabled, false)
+  assert.equal(pressure.configured, false)
+  assert.equal(pressure.attached, false)
+  assert.equal(pressure.maxPressure, null)
+  assert.equal(pressure.killJobs, false)
+  assert.deepEqual(pressure.counters, {
+    checks: 0,
+    allowed: 0,
+    denied: 0,
+    unavailable: 0,
+    errors: 0,
+    killLists: 0,
+    killRequests: 0,
+    killed: 0,
+    killSkipped: 0,
+    killErrors: 0,
+  })
+  assert.deepEqual(pressure.scopes, [])
 })
 
 test('quota tools share one governor and report ok, soft, hard and overage', async () => {
@@ -270,4 +293,121 @@ test('enforce object can throw QuotaDeniedError and expose the enforcer on gover
   assert.equal(governor.enforcer.attached, true)
   governor.enforcer.detach()
   assert.equal(governor.enforcer.attached, false)
+})
+
+test('pressureLimit attaches a gate even when enforce is off and kills only running jobs', async () => {
+  const { ctx, registered, handlers } = fakeContext()
+  const session = { id: 'session:pressure' }
+  const listCallers = []
+  const killCalls = []
+  ctx.tokenMeter = {
+    contextPressure: (target) => {
+      assert.equal(target, session)
+      return { pressureTokens: 150 }
+    },
+  }
+  ctx.jobs = {
+    list(caller) {
+      listCallers.push(caller)
+      return [
+        { id: 'bash-running', status: 'running' },
+        { id: 'bash-completed', status: 'completed' },
+      ]
+    },
+    kill(id, caller, reason) {
+      killCalls.push({ id, caller, reason })
+      return 'requested'
+    },
+  }
+
+  const governor = apply(ctx, { pressureLimit: 100, killJobs: true })
+  assert.equal(governor.pressure.killJobs, true)
+  assert.equal(handlers.get('tools/pre-execute')?.length, 1)
+  // A pressure-only gate must not consume or book tool results.
+  assert.equal(handlers.get('tools/result'), undefined)
+
+  const denied = await runPreExecute(handlers, { name: 'shell', agent: { session } })
+  assert.deepEqual(denied, { kind: 'deny', allow: false, reason: 'pressure' })
+  assert.deepEqual(listCallers, ['session:pressure'])
+  assert.deepEqual(killCalls, [
+    { id: 'bash-running', caller: 'session:pressure', reason: 'quota' },
+  ])
+
+  const status = await registered.get('quota_pressure_status').execute({}, {})
+  assert.equal(status.enabled, true)
+  assert.equal(status.configured, true)
+  assert.equal(status.attached, true)
+  assert.equal(status.maxPressure, 100)
+  assert.equal(status.killJobs, true)
+  assert.equal(status.counters.checks, 1)
+  assert.equal(status.counters.denied, 1)
+  assert.equal(status.counters.killRequests, 1)
+  assert.deepEqual(status.killedJobs, ['bash-running'])
+
+  // Quota's own control-plane tools are never gated by the pressure check.
+  const bypassed = await runPreExecute(handlers, {
+    name: 'quota_pressure_status',
+    agent: { session },
+  })
+  assert.equal(bypassed.kind, 'allow')
+
+  const enforceStatus = await registered.get('quota_enforce_status').execute({}, {})
+  assert.equal(enforceStatus.pressure.maxPressure, 100)
+})
+
+test('a governor hard denial is decided before the pressure guard runs', async () => {
+  const { ctx, registered, handlers } = fakeContext()
+  const session = { id: 'session:order' }
+  const killCalls = []
+  ctx.tokenMeter = { contextPressure: () => ({ pressureTokens: 999 }) }
+  ctx.jobs = {
+    list: () => [{ id: 'bash-running', status: 'running' }],
+    kill(id, caller, reason) {
+      killCalls.push({ id, caller, reason })
+      return 'requested'
+    },
+  }
+
+  apply(ctx, {
+    enforce: true,
+    limits: { tokens: 0 },
+    scopes: [{ id: 'default', used: { tokens: 1 } }],
+    costOf: { shell: 1 },
+    pressureLimit: 100,
+    killJobs: true,
+  })
+
+  const denied = await runPreExecute(handlers, { name: 'shell', agent: { session } })
+  assert.equal(denied.kind, 'deny')
+  assert.match(denied.reason, /hard limit/i)
+  assert.deepEqual(killCalls, [])
+
+  const status = await registered.get('quota_pressure_status').execute({}, {})
+  assert.equal(status.counters.checks, 0)
+  assert.equal(status.counters.denied, 0)
+  assert.equal(status.attached, true)
+})
+
+test('pressureLimit fails open when the token-meter service is missing', async () => {
+  const { ctx, registered, handlers } = fakeContext()
+  apply(ctx, { pressureLimit: 100 })
+
+  const allowed = await runPreExecute(handlers, {
+    name: 'shell',
+    agent: { session: { id: 'session:no-meter' } },
+  })
+  assert.equal(allowed.kind, 'allow')
+
+  const status = await registered.get('quota_pressure_status').execute({}, {})
+  assert.equal(status.enabled, true)
+  assert.equal(status.available, false)
+  assert.equal(status.counters.checks, 1)
+  assert.equal(status.counters.unavailable, 1)
+  assert.equal(status.last.reason, 'unavailable')
+})
+
+test('pressureLimit validates its config', () => {
+  const { ctx } = fakeContext()
+  assert.throws(() => apply(ctx, { pressureLimit: -1 }), /maxPressure/)
+  assert.throws(() => apply(ctx, { pressureLimit: 10, killJobs: 'yes' }), /killJobs/)
 })

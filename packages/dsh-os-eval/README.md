@@ -2,7 +2,7 @@
 
 > Regression eval gates for DSH agents: case definitions, baseline comparison and CI verdicts.
 
-**0.2.1 · pure ESM + JSDoc · Node 24+ · Apache-2.0**
+**0.2.2 · pure ESM + JSDoc · Node 24+ · Apache-2.0**
 
 A community project. Not affiliated with DeepSeek. No SLA, no warranty.
 
@@ -21,7 +21,8 @@ renamed tool can break an instruction without anyone noticing.
   `session-query` (`ctx.sessionQuery.readSession(sessionId)`) or from one
   exported JSONL file, paired into a tool trajectory, and graded
   deterministically. A host runner and a mock remain available when neither
-  source is supplied.
+  source is supplied. An explicit watcher can also follow one session's live
+  `session/event` feed and pair steps as they arrive.
 - **Baselines are explicit.** Compare token usage with a stored p50 and turn a
   >20% regression into a WARN instead of a surprise bill.
 - **CI gets one verdict.** `PASS`, `WARN`, or `FAIL`, with reasons and the
@@ -108,12 +109,17 @@ call in any branch. If the host has no `sessionQuery` service, `liveSessionId`
 fails with a clear `SESSION_QUERY_UNAVAILABLE` error instead of falling through
 to the runner or the mock; `sessionFile` and the runner/mock paths keep working.
 
+To follow a session while it is still growing, attach an explicit in-memory
+watcher with `eval_watch` (see [below](#eval_watch)). It subscribes to one
+session id only when you ask it to; it is never started automatically.
+
 Without a session source or an injected runner, pass a `mock` result.
 
 ## Tools
 
-All three tools are local. They do not call a model, open a network connection,
-or write files.
+All four tools are local. They do not call a model, open a network connection,
+or write files. `eval_watch` can subscribe to the host's `session/event` feed,
+but only after an explicit attach, and it keeps observed events in memory only.
 
 ### `eval_run`
 
@@ -143,6 +149,49 @@ recorded as a `FAIL` run.
 
 The standalone mock echoes `input` as text and reports 0 steps/tokens unless the
 mock overrides them. It exists to test the gate, not to evaluate a model.
+
+### `eval_watch`
+
+Attaches, inspects, or detaches an explicit live watcher for one session id.
+Attaching subscribes to `ctx.on('session/event', (session, event) => ...)`,
+ignores events from every other session, and appends the matching events in
+memory. Pairing is by tool call id, using the same parser as recorded files.
+Unknown event types and fields are retained by the watcher and skipped by the
+trajectory, so newer session events do not break it.
+
+| Parameter | Type | Meaning |
+|---|---|---|
+| `action` | string (required) | `attach`, `status`, or `detach`. |
+| `sessionId` | string | Target session id. Required for `attach`; optional for `status` and `detach` (omit to cover every watcher). |
+
+Examples:
+
+```json
+{ "action": "attach", "sessionId": "01KSESSIONID" }
+{ "action": "status", "sessionId": "01KSESSIONID" }
+{ "action": "detach" }
+```
+
+Every action returns `{ action, watchers }`, where each watcher row is
+`{ sessionId, attached, events, steps, paired, toolErrors, tools }`. Raw events,
+tool arguments, and tool results are never returned by the tool.
+
+Lifecycle rules:
+
+- **Explicit only.** Activation registers the tool but creates no watcher and
+  subscribes to nothing. `attach` is the only action that registers a listener.
+- **One listener per session id.** Attaching an already-attached id is
+  idempotent; it does not duplicate the subscription.
+- **Detach stops receipt, not history.** `detach` removes the listener (or all
+  listeners when `sessionId` is omitted) and returns the final counts; already
+  observed events remain in memory for `snapshot()` and `trajectory()` until the
+  plugin instance is gone. Re-attaching continues the same in-memory history.
+- **No persistence.** Watchers are not stored, not restored after a restart, and
+  are detached when the plugin is disposed. Nothing is written to disk. A
+  long-lived watcher grows by one retained event per append; detach it when the
+  session is finished.
+- **Other sessions are ignored** by session id, and malformed or unknown events
+  do not throw.
 
 ### `eval_gate`
 
@@ -287,6 +336,37 @@ Errors use stable `EvalError` codes: `INVALID_SESSION_ID`,
 `SESSION_QUERY_UNAVAILABLE`, `SESSION_QUERY_READ_FAILED` (or the service's own
 stable `SESSION_QUERY_*` code), and `INVALID_SESSION_SNAPSHOT`.
 
+## Live watcher API
+
+The `dsh-os-eval/watch` subpath exposes the explicit subscription handle used by
+`eval_watch`:
+
+```js
+import { createWatcher } from 'dsh-os-eval/watch'
+
+const watcher = createWatcher({ ctx, sessionId: '01KSESSIONID' })
+watcher.attach()       // subscribes to ctx.on('session/event') for this id
+
+watcher.snapshot()     // raw events observed so far (shallow copy)
+watcher.trajectory()   // paired tool steps, same shape as trajectoryOf(session)
+
+watcher.detach()       // stops future events; history stays readable
+```
+
+`createWatcher({ ctx, sessionId })` returns exactly
+`{ attach, detach, snapshot, trajectory }`. `attach()` registers one
+`session/event` listener and ignores events whose `session.id` is not the
+configured id; calling it again while attached is a no-op. `detach()` removes
+the listener and is idempotent. `snapshot()` returns the retained events in
+append order; `trajectory()` serializes them to the same JSONL shape as a
+recorded file and reuses `trajectoryOf`, so calls and results pair by call id,
+results that arrive before their call still pair, and unknown events are
+skipped. Raw events are never persisted.
+
+Errors use stable `EvalError` codes: `INVALID_SESSION_ID`,
+`SESSION_EVENTS_UNAVAILABLE` when `ctx.on('session/event')` is missing, and
+`SESSION_EVENTS_SUBSCRIBE_FAILED` when the host subscription throws.
+
 ## Scoring
 
 Every check in `expect` must hold; a single failure makes the run `FAIL`.
@@ -312,42 +392,55 @@ than crashing the gate.
 - **No model, network, or shell access.** The core is pure logic. One sync
   filesystem read happens only when a caller explicitly supplies `sessionFile`;
   a `liveSessionId` read delegates one exact-read call to the host's
-  `ctx.sessionQuery` service.
+  `ctx.sessionQuery` service; a watcher subscribes to the host's in-process
+  `session/event` feed only after an explicit `eval_watch` attach. No outbound
+  network request is made in any path.
 - **Visible-tool-run data.** The store keeps the latest run per case: caseId,
   output, steps, tokens, latency, status, reasons, `source`, plus a compact
   trajectory summary (session id, counts, tool names, error count). It does not
   keep prompts, user/system messages, complete tool transcripts, or history.
+  The live watcher is the one explicit exception: after an attach it retains raw
+  `session/event` objects for the watched session in memory. `eval_watch` status
+  exposes only counts and tool names, never raw events, arguments, or results.
 - **Reports contain summaries only.** `eval_report` omits `output`, tool
-  arguments, and raw tool results. The programmatic `replay`, `evaluate`, and
-  `evaluateLive` APIs return step details to their caller; nothing is persisted
-  by this package.
+  arguments, and raw tool results. The programmatic `replay`, `evaluate`,
+  `evaluateLive`, and watcher `snapshot`/`trajectory` APIs return step details to
+  their caller; nothing is persisted by this package.
 - **Memory only.** Data lives for the lifetime of the plugin instance and is
   gone after a restart. Baselines are loaded from config, not from a database.
-- **Explicit file or explicit session id.** `sessionFile` reads exactly the one
-  path given by the caller; `liveSessionId` reads exactly the one session id
-  given by the caller. There is no session-root discovery, directory listing, or
+  Watchers are not persisted: detach stops the subscription, and a plugin
+  restart discards both the subscription and the retained events.
+- **Explicit file, explicit session id, explicit watcher.** `sessionFile` reads
+  exactly the one path given by the caller; `liveSessionId` reads exactly the one
+  session id given by the caller; a watcher observes exactly the one session id
+  given to `attach`. There is no session-root discovery, directory listing, or
   subagent archive traversal. Treat exported logs and session data as trusted
   fixtures.
 - **Injected runners run with host permissions.** If a host supplies
   `apply(ctx, { runner })`, that code can do anything the host can do. Audit it
   like any other plugin, and never put secrets in cases, mocks, or recordings.
 
-## Limitations (0.2.1)
+## Limitations (0.2.2)
 
-- **Reads files or exact session snapshots, not streams.** Exported plain-text
+- **Exact reads by default; live watching is opt-in.** Exported plain-text
   JSONL (`sessionFile`) and `ctx.sessionQuery.readSession(sessionId)`
-  (`liveSessionId`) are supported. There is no live event-stream subscription,
-  no OTel exporter, and no direct session-database read. Zstandard-compressed
-  logs (`.jsonl.zstd`), session directories, and exported ZIP archives are not
-  supported; use the host's Export session action and pass the resulting
-  uncompressed `.jsonl` file.
+  (`liveSessionId`) are supported. A watcher can subscribe to one session's
+  `session/event` feed after an explicit attach, but it keeps raw events in
+  memory only and does not reconcile sequence gaps, resume a detached period, or
+  persist history. There is no OTel exporter and no direct session-database
+  read. Zstandard-compressed logs (`.jsonl.zstd`), session directories, and
+  exported ZIP archives are not supported; use the host's Export session action
+  and pass the resulting uncompressed `.jsonl` file.
 - **Recorded output replay, not live model replay.** `replay` invokes only the
   local synchronous callback it is given. The package never calls a model,
   re-runs a prompt, or compares against a fresh live run. A `liveSessionId` read
-  grades the session's already-recorded events, not a new generation.
-- **No session-query subscription.** `attach(ctx)` probes availability only; the
-  plugin does not observe session events as they arrive. Re-run `eval_run` after
-  a session grows to grade a newer snapshot.
+  grades the session's already-recorded events, not a new generation. A watcher
+  observes events the host already committed; it does not drive the session.
+- **No persistent or automatic watcher.** `attach(ctx)` in the `live` adapter
+  still probes availability only, and `eval_run` never consumes a watcher: it
+  re-reads a snapshot on each call. A watcher exists only after an explicit
+  `eval_watch` attach, keeps events in memory, and stops at detach or plugin
+  dispose. There is no automatic resume after a plugin reload.
 - **Synchronous runners only.** Returning a Promise raises
   `ASYNC_RUNNER_UNSUPPORTED`.
 - **One latest run per case.** No repeated runs, flake detection, confidence

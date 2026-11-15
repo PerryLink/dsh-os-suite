@@ -229,11 +229,15 @@ unverified file writer by default.
 ### Lock provider layer
 
 `src/lock.js` isolates the mutual-exclusion primitive behind
-`acquire(key, { ttlMs, owner })`, `renew(handle, { ttlMs })`,
-`release(handle)`, and `inspect(key)`:
+`acquire(key, { ttlMs, owner, issueFence? })`, `renew(handle, { ttlMs })`,
+`release(handle)`, `inspect(key)`, and `currentFence()`:
 
 - Every handle carries a random `token`. `renew` and `release` verify it, so an
   expired holder cannot mutate a lock that a newer owner has acquired.
+- Every successful acquire also issues a monotonic `fence`. `FileLockProvider`
+  keeps the counter in `fencePath` (default `<dir>/fence`) and allocates it with
+  read-increment + a `wx` candidate + atomic rename; `MemoryLockProvider` uses
+  an in-process counter. The counter is never reset by `release`/`clear`.
 - `FileLockProvider` keeps one `<sha256(key)>.lock` file per key. Creation is
   `wx`; expiry is evaluated against the provider clock; reclaim renames the
   stale file and retries. Malformed/legacy files without `expiresAt` are held
@@ -241,17 +245,26 @@ unverified file writer by default.
 - `MemoryLockProvider` mirrors the contract in a `Map` for tests; instances do
   not share state.
 - `withLock(provider, key, fn, options)` releases on success and on throw.
-- `applyPatchset` accepts `lockProvider`, `lockTtlMs`, and `lockOwner`; the
-  default is a file provider at `<root>/.dsh-os-lease/locks` with a 15-minute
-  TTL. Lock acquisition happens before any journal or target write, and
-  `LOCKED` errors carry `details.owner`/`details.expiresAt`.
+- `applyPatchset` accepts `lockProvider`, `lockTtlMs`, `lockOwner`, and
+  `fence`; the default is a file provider at `<root>/.dsh-os-lease/locks` with
+  the counter at `<root>/.dsh-os-lease/fence` and a 15-minute TTL. Lock
+  acquisition happens before any journal or target write, and `LOCKED` errors
+  carry `details.owner`/`details.expiresAt`.
+- Before each target write (and each rollback restore/delete) the applier calls
+  `assertFence(root, fence)`: a current counter greater than the caller's token
+  throws `FENCED`. The journal records `fence`. Without an explicit token the
+  applier uses the one from its own acquisition; `rollback` stays unfenced when
+  no `{ fence }` is supplied.
 
 Cross-host behavior is deliberately documented as a lease, not a strong
 distributed lock: shared NFSv4/SMB 3.x mounts with atomic `O_EXCL`/rename and
 bounded clock skew can work; FUSE/cloud-sync mounts cannot; reclaim and release
-retain small TOCTOU windows; the target filesystem does not enforce fencing.
-See `docs/cross-host-locks.md` for conditions, TTL/clock guidance, and Redis/SQL
-interface sketches (not implemented here).
+retain small TOCTOU windows. Fencing rejects a write after a newer token became
+visible, but the check and the write are not atomic: a holder paused between
+them can still write, and strong consistency still requires an external store
+that applies the compare-and-write atomically. See `docs/cross-host-locks.md`
+for conditions, TTL/clock guidance, fencing limits, and Redis/SQL interface
+sketches (not implemented here).
 
 ### Cordis / future service layer
 
@@ -323,6 +336,9 @@ the journal/backups on disk, so protect `.dsh-os-lease/` accordingly.
 - Pluggable per-path locks (implemented in `0.2.0`): `FileLockProvider` with
   owner/expiry records and stale reclaim, `MemoryLockProvider`, `withLock`, and
   custom providers through `applyPatchset({ lockProvider })`.
+- Monotonic fencing tokens (implemented in `0.2.1`): per-acquire file/in-memory
+  counters, `assertFence` before each write, `FENCED` on stale tokens, and the
+  fence recorded in the journal.
 - Remaining: integrate with DSH edit/write intent; emit commit/rollback events
   for audit.
 
@@ -334,8 +350,9 @@ the journal/backups on disk, so protect `.dsh-os-lease/` accordingly.
 
 **Days 22–30 — multi-process and release**
 - File locks already coordinate processes on one host and, with the documented
-  shared-FS conditions, across hosts. Remaining: a first-party Redis/SQL
-  provider (or daemon), renew-during-apply, and fencing-token integration.
+  shared-FS conditions, across hosts. Fencing tokens are integrated into the
+  write path. Remaining: a first-party Redis/SQL provider (or daemon) with an
+  atomic token-check-plus-write, and renew-during-apply.
 - Case/symlink canonicalization strategy per workspace.
 - Stress tests for concurrent agents, docs/examples, changelog, publish
   `0.2.0` after rechecking the package name.

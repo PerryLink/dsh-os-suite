@@ -152,8 +152,145 @@ test('CLI exposes help and version', () => {
   assert.equal(help.status, 0)
   assert.match(help.stdout, /trace_export/)
   assert.match(help.stdout, /OTLP\/JSON only/)
+  assert.match(help.stdout, /traceparent/)
 
   const version = run(['--version'])
   assert.equal(version.status, 0)
   assert.match(version.stdout, /dsh-os-trace \d+\.\d+\.\d+/)
+})
+
+const TP_TRACE = 'a'.repeat(32)
+const TP_ROOT_SPAN = 'b'.repeat(16)
+const TP_CHILD_SPAN = 'c'.repeat(16)
+const TP_ROOT = `00-${TP_TRACE}-${TP_ROOT_SPAN}-01`
+const TP_CHILD = `00-${TP_TRACE}-${TP_CHILD_SPAN}-00`
+
+test('CLI trace_export --format otlp --traceparent writes one header per span', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'dsh-os-trace-cli-'))
+  try {
+    const spansFile = join(directory, 'spans.json')
+    const linesFile = join(directory, 'traceparent.txt')
+    writeFileSync(
+      spansFile,
+      JSON.stringify([
+        span('root', {
+          kind: 'workflow',
+          name: 'run',
+          attrs: { traceparent: TP_ROOT },
+        }),
+        span('child', {
+          parentId: 'root',
+          startMs: T0 + 10,
+          attrs: { traceparent: TP_CHILD },
+        }),
+      ]),
+      'utf8',
+    )
+
+    const result = run(['trace_export', spansFile, '--format', 'otlp', '--traceparent'])
+    assert.equal(result.status, 0, result.stderr)
+    assert.deepEqual(result.stdout.trim().split(/\r?\n/), [TP_ROOT, TP_CHILD])
+    assert.equal(result.stdout.includes('{'), false)
+
+    const toFile = run([
+      'trace_export',
+      spansFile,
+      '--format',
+      'otlp',
+      '--traceparent',
+      '--out',
+      linesFile,
+    ])
+    assert.equal(toFile.status, 0, toFile.stderr)
+    assert.equal(toFile.stdout, '')
+    assert.deepEqual(
+      readFileSync(linesFile, 'utf8').trim().split(/\r?\n/),
+      [TP_ROOT, TP_CHILD],
+    )
+  } finally {
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('CLI trace_import --traceparent reads headers into a sealed bundle', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'dsh-os-trace-cli-'))
+  try {
+    const tpFile = join(directory, 'traceparent.txt')
+    const bundleFile = join(directory, 'bundle.json')
+    writeFileSync(tpFile, `${TP_ROOT}\n\n${TP_CHILD}\n`, 'utf8')
+
+    const imported = run(['trace_import', tpFile, '--traceparent'])
+    assert.equal(imported.status, 0, imported.stderr)
+    const bundle = JSON.parse(imported.stdout)
+    assert.equal(bundle.format, 'dsh-os-trace/bundle')
+    assert.equal(bundle.spanCount, 2)
+    assert.equal(verifyBundle(bundle).ok, true)
+    assert.deepEqual(
+      bundle.spans.map((entry) => entry.id),
+      [TP_ROOT_SPAN, TP_CHILD_SPAN],
+    )
+    assert.deepEqual(
+      bundle.spans.map((entry) => entry.sessionId),
+      [TP_TRACE, TP_TRACE],
+    )
+    assert.deepEqual(
+      bundle.spans.map((entry) => entry.attrs.traceparent),
+      [TP_ROOT, TP_CHILD],
+    )
+    assert.deepEqual(
+      bundle.spans.map((entry) => entry.parentId),
+      [undefined, undefined],
+    )
+
+    writeFileSync(bundleFile, JSON.stringify(bundle), 'utf8')
+    const reexported = run([
+      'trace_export',
+      bundleFile,
+      '--format',
+      'otlp',
+      '--traceparent',
+    ])
+    assert.equal(reexported.status, 0, reexported.stderr)
+    assert.deepEqual(reexported.stdout.trim().split(/\r?\n/), [TP_ROOT, TP_CHILD])
+  } finally {
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('CLI rejects invalid traceparent lines and mixed modes', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'dsh-os-trace-cli-'))
+  try {
+    const tpFile = join(directory, 'traceparent.txt')
+    const badFile = join(directory, 'bad-traceparent.txt')
+    const spansFile = join(directory, 'spans.json')
+    writeFileSync(tpFile, `${TP_ROOT}\n`, 'utf8')
+    writeFileSync(
+      badFile,
+      `${TP_ROOT}\n00-${'0'.repeat(32)}-${TP_CHILD_SPAN}-01\n`,
+      'utf8',
+    )
+    writeFileSync(spansFile, JSON.stringify([span('root')]), 'utf8')
+
+    const bad = run(['trace_import', badFile, '--traceparent'])
+    assert.equal(bad.status, 2)
+    assert.match(bad.stderr, /line 2/)
+    assert.match(bad.stderr, /not a valid W3C traceparent/)
+    assert.equal(bad.stdout, '')
+    assert.equal(/^\s+at /m.test(bad.stderr), false)
+
+    writeFileSync(tpFile, `${TP_ROOT}\n${TP_ROOT}\n`, 'utf8')
+    const repeated = run(['trace_import', tpFile, '--traceparent'])
+    assert.equal(repeated.status, 2)
+    assert.match(repeated.stderr, /repeats span id/)
+
+    const wrongExport = run(['trace_export', spansFile, '--traceparent'])
+    assert.equal(wrongExport.status, 2)
+    assert.match(wrongExport.stderr, /requires --format otlp/)
+
+    const mixedImport = run(['trace_import', tpFile, '--traceparent', '--format', 'otlp'])
+    assert.equal(mixedImport.status, 2)
+    assert.match(mixedImport.stderr, /do not combine/)
+  } finally {
+    rmSync(directory, { recursive: true, force: true })
+  }
 })

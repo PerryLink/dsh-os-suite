@@ -268,3 +268,191 @@ test('fromOtlp rejects bad JSON and malformed OTLP envelopes', () => {
   )
   assert.deepEqual(fromOtlp({ resourceSpans: [] }), [])
 })
+
+const W3C_TRACE = '1'.repeat(32)
+const W3C_ROOT_SPAN = '2'.repeat(16)
+const W3C_CHILD_SPAN = '3'.repeat(16)
+const W3C_ROOT = `00-${W3C_TRACE}-${W3C_ROOT_SPAN}-01`
+const W3C_CHILD = `00-${W3C_TRACE}-${W3C_CHILD_SPAN}-00`
+
+test('toOtlp preserves traceparent and uses its ids and flags', () => {
+  const spans = [
+    span('root', {
+      kind: 'workflow',
+      name: 'run',
+      attrs: { traceparent: W3C_ROOT, label: 'root' },
+    }),
+    span('child', { parentId: 'root', attrs: { traceparent: W3C_CHILD } }),
+  ]
+  const [root, child] = toOtlp(spans).resourceSpans[0].scopeSpans[0].spans
+
+  assert.equal(root.traceId, W3C_TRACE)
+  assert.equal(root.spanId, W3C_ROOT_SPAN)
+  assert.equal(root.flags, 1)
+  assert.equal(child.traceId, W3C_TRACE)
+  assert.equal(child.spanId, W3C_CHILD_SPAN)
+  assert.equal(child.parentSpanId, W3C_ROOT_SPAN)
+  assert.equal(child.flags, 0)
+  assert.deepEqual(attributeMap(root.attributes).traceparent, { stringValue: W3C_ROOT })
+  assert.equal(Object.hasOwn(attributeMap(root.attributes), OTLP_ATTR.traceparent), false)
+
+  const [rootWithMeta, childWithMeta] = toOtlp(spans, { traceparent: true }).resourceSpans[0]
+    .scopeSpans[0].spans
+  assert.deepEqual(
+    attributeMap(rootWithMeta.attributes)[OTLP_ATTR.traceparent],
+    { stringValue: W3C_ROOT },
+  )
+  assert.deepEqual(
+    attributeMap(childWithMeta.attributes)[OTLP_ATTR.traceparent],
+    { stringValue: W3C_CHILD },
+  )
+
+  const plainWithMeta = toOtlp([span('plain')], { traceparent: true })
+    .resourceSpans[0].scopeSpans[0].spans[0]
+  assert.match(
+    attributeMap(plainWithMeta.attributes)[OTLP_ATTR.traceparent].stringValue,
+    /^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/,
+  )
+
+  const invalid = toOtlp([span('x', { attrs: { traceparent: 'not-a-header' } })])
+    .resourceSpans[0].scopeSpans[0].spans[0]
+  assert.deepEqual(attributeMap(invalid.attributes).traceparent, { stringValue: 'not-a-header' })
+  assert.equal(invalid.traceId, sha256('session-1').slice(0, 32))
+  assert.equal(invalid.spanId, sha256('x').slice(0, 16))
+  assert.equal(Object.hasOwn(invalid, 'flags'), false)
+
+  assert.throws(
+    () => toOtlp(spans, { traceparent: 'yes' }),
+    (error) => error.code === 'INVALID_OTLP' && /traceparent/.test(error.message),
+  )
+})
+
+test('fromOtlp parses traceparent attributes and fills trace/span/parent ids', () => {
+  const imported = fromOtlp({
+    resourceSpans: [
+      {
+        scopeSpans: [
+          {
+            spans: [
+              {
+                name: 'server',
+                attributes: [
+                  { key: 'traceparent', value: { stringValue: W3C_ROOT } },
+                ],
+              },
+              {
+                // Top-level ids are deliberately stale: the header wins.
+                traceId: 'f'.repeat(32),
+                spanId: 'e'.repeat(16),
+                parentSpanId: W3C_ROOT_SPAN,
+                name: 'child',
+                attributes: [
+                  { key: 'traceparent', value: { stringValue: W3C_CHILD } },
+                  { key: OTLP_ATTR.traceparent, value: { stringValue: W3C_CHILD } },
+                  { key: 'http.method', value: { stringValue: 'GET' } },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  })
+
+  assert.equal(imported[0].id, W3C_ROOT_SPAN)
+  assert.equal(imported[0].sessionId, W3C_TRACE)
+  assert.deepEqual(imported[0].attrs, { traceparent: W3C_ROOT })
+
+  assert.equal(imported[1].id, W3C_CHILD_SPAN)
+  assert.equal(imported[1].sessionId, W3C_TRACE)
+  assert.equal(imported[1].parentId, W3C_ROOT_SPAN)
+  assert.deepEqual(imported[1].attrs, {
+    traceparent: W3C_CHILD,
+    'http.method': 'GET',
+  })
+
+  const metadataOnly = fromOtlp({
+    resourceSpans: [
+      {
+        scopeSpans: [
+          {
+            spans: [
+              {
+                name: 'meta-only',
+                attributes: [
+                  { key: OTLP_ATTR.traceparent, value: { stringValue: W3C_ROOT } },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  })
+  assert.equal(metadataOnly[0].id, W3C_ROOT_SPAN)
+  assert.equal(metadataOnly[0].sessionId, W3C_TRACE)
+  assert.equal(metadataOnly[0].attrs, undefined)
+})
+
+test('fromOtlp treats invalid or all-zero traceparent attributes as opaque data', () => {
+  const imported = fromOtlp({
+    resourceSpans: [
+      {
+        scopeSpans: [
+          {
+            spans: [
+              {
+                traceId: '7'.repeat(32),
+                spanId: '8'.repeat(16),
+                name: 'invalid',
+                attributes: [
+                  {
+                    key: 'traceparent',
+                    value: { stringValue: `00-${'0'.repeat(32)}-${'9'.repeat(16)}-01` },
+                  },
+                ],
+              },
+              {
+                name: 'garbage',
+                attributes: [{ key: 'traceparent', value: { stringValue: 'garbage' } }],
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  })
+
+  assert.equal(imported[0].id, '8'.repeat(16))
+  assert.equal(imported[0].sessionId, '7'.repeat(32))
+  assert.equal(imported[0].attrs.traceparent, `00-${'0'.repeat(32)}-${'9'.repeat(16)}-01`)
+  assert.equal(imported[1].id, 'otlp-2')
+  assert.equal(imported[1].sessionId, 'otlp')
+  assert.equal(imported[1].attrs.traceparent, 'garbage')
+})
+
+test('traceparent spans round-trip through OTLP with dsh.traceparent metadata', () => {
+  const spans = [
+    span('root', {
+      kind: 'workflow',
+      name: 'run',
+      agentPath: 'lead',
+      attrs: { traceparent: W3C_ROOT, label: 'root' },
+    }),
+    span('child', {
+      parentId: 'root',
+      startMs: T0 + 10,
+      endMs: T0 + 20,
+      status: 'error',
+      attrs: { traceparent: W3C_CHILD, attempt: 2 },
+    }),
+  ]
+
+  assert.deepEqual(fromOtlp(toOtlp(spans, { traceparent: true })), spans)
+  assert.deepEqual(fromOtlp(toOtlp(spans)), spans)
+
+  const store = createTraceStore()
+  for (const imported of fromOtlp(toOtlp(spans, { traceparent: true }))) store.ingest(imported)
+  assert.equal(verifyBundle(store.exportBundle()).ok, true)
+  assert.deepEqual(store.why('child', 2).edges, [{ parentId: 'root', childId: 'child' }])
+})

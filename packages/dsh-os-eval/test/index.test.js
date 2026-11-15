@@ -34,7 +34,68 @@ function createContext(extra = {}) {
   }
 }
 
-test('apply registers exactly eval_run, eval_gate, and eval_report', () => {
+/**
+ * Tool-registry context that can also publish `session/event` and record
+ * `ctx.effect` disposers, like the Cordis host does.
+ *
+ * @returns {{
+ *   tools: object[],
+ *   ctx: object,
+ *   listeners: Set<Function>,
+ *   effects: Function[],
+ *   emit: (sessionId: string, event: object) => void,
+ *   dispose: () => void,
+ * }} Fake host context.
+ */
+function createWatchContext() {
+  /** @type {object[]} */
+  const tools = []
+  /** @type {Set<Function>} */
+  const listeners = new Set()
+  /** @type {Function[]} */
+  const effects = []
+
+  return {
+    tools,
+    listeners,
+    effects,
+    ctx: {
+      tools: {
+        register(definition) {
+          tools.push(definition)
+        },
+      },
+      on(eventName, listener) {
+        assert.equal(eventName, 'session/event')
+        listeners.add(listener)
+        return () => {
+          listeners.delete(listener)
+        }
+      },
+      effect(setup) {
+        effects.push(setup())
+      },
+    },
+    emit(sessionId, event) {
+      for (const listener of [...listeners]) listener({ id: sessionId }, event)
+    },
+    dispose() {
+      for (const dispose of effects) dispose()
+    },
+  }
+}
+
+/**
+ * @param {string} type Event type.
+ * @param {object} data Event payload.
+ * @param {number} seq Sequence number.
+ * @returns {object} Session event.
+ */
+function watchEvent(type, data, seq) {
+  return { type, seq, time: 1000 + seq, data }
+}
+
+test('apply registers exactly eval_run, eval_watch, eval_gate, and eval_report', () => {
   const { tools, ctx } = createContext()
   apply(ctx, {
     cases: [{
@@ -45,7 +106,10 @@ test('apply registers exactly eval_run, eval_gate, and eval_report', () => {
     }],
   })
 
-  assert.deepEqual(tools.map((tool) => tool.name), ['eval_run', 'eval_gate', 'eval_report'])
+  assert.deepEqual(
+    tools.map((tool) => tool.name),
+    ['eval_run', 'eval_watch', 'eval_gate', 'eval_report'],
+  )
 })
 
 test('configured cases, baselines, and an injected runner drive the gate', async () => {
@@ -349,4 +413,133 @@ test('sessionFile and liveSessionId are mutually exclusive', async () => {
       && /either sessionFile or liveSessionId/.test(error.message),
   )
   assert.equal(reads, 0)
+})
+
+test('eval_watch attach is explicit, filters by session, pairs steps, and detaches', async () => {
+  const fake = createWatchContext()
+  apply(fake.ctx)
+  const watch = fake.tools.find((tool) => tool.name === 'eval_watch')
+
+  // Activation registers tools only: there is no watcher and no listener yet.
+  assert.equal(fake.listeners.size, 0)
+  assert.deepEqual(await watch.execute({ action: 'status' }), { action: 'status', watchers: [] })
+
+  const attached = await watch.execute({ action: 'attach', sessionId: 'session-a' })
+  assert.equal(fake.listeners.size, 1)
+  assert.deepEqual(attached, {
+    action: 'attach',
+    watchers: [{
+      sessionId: 'session-a',
+      attached: true,
+      events: 0,
+      steps: 0,
+      paired: 0,
+      toolErrors: 0,
+      tools: [],
+    }],
+  })
+
+  fake.emit('session-b', watchEvent('tool/call', { callId: 'other', name: 'write' }, 1))
+  fake.emit('session-a', watchEvent('turn/start', { turn: 1 }, 2))
+  fake.emit('session-a', watchEvent('tool/call', {
+    turn: 1,
+    step: 1,
+    callId: 'call-1',
+    name: 'read',
+    arguments: '{"path":"README.md"}',
+  }, 3))
+  fake.emit('session-a', watchEvent('future/event', { unknown: true }, 4))
+  fake.emit('session-a', watchEvent('tool/result', {
+    turn: 1,
+    step: 1,
+    message: {
+      role: 'tool',
+      toolCallId: 'call-1',
+      content: [{ type: 'text', text: 'ok' }],
+      isError: true,
+    },
+  }, 5))
+
+  const status = await watch.execute({ action: 'status', sessionId: 'session-a' })
+  assert.deepEqual(status, {
+    action: 'status',
+    watchers: [{
+      sessionId: 'session-a',
+      attached: true,
+      events: 4,
+      steps: 1,
+      paired: 1,
+      toolErrors: 1,
+      tools: ['read'],
+    }],
+  })
+  assert.equal((await watch.execute({ action: 'status' })).watchers.length, 1)
+
+  const missing = await watch.execute({ action: 'status', sessionId: 'session-missing' })
+  assert.deepEqual(missing.watchers[0], {
+    sessionId: 'session-missing',
+    attached: false,
+    events: 0,
+    steps: 0,
+    paired: 0,
+    toolErrors: 0,
+    tools: [],
+  })
+
+  const detached = await watch.execute({ action: 'detach', sessionId: 'session-a' })
+  assert.equal(fake.listeners.size, 0)
+  assert.equal(detached.watchers[0].attached, false)
+  assert.equal(detached.watchers[0].events, 4)
+
+  fake.emit('session-a', watchEvent('turn/end', { turn: 1 }, 6))
+  assert.deepEqual((await watch.execute({ action: 'status' })).watchers, [])
+})
+
+test('eval_watch attach is idempotent, detach-all clears watchers, and plugin dispose detaches', async () => {
+  const fake = createWatchContext()
+  apply(fake.ctx)
+  const watch = fake.tools.find((tool) => tool.name === 'eval_watch')
+
+  await watch.execute({ action: 'attach', sessionId: 'session-a' })
+  await watch.execute({ action: 'attach', sessionId: 'session-a' })
+  assert.equal(fake.listeners.size, 1)
+
+  await watch.execute({ action: 'attach', sessionId: 'session-b' })
+  assert.equal(fake.listeners.size, 2)
+
+  const detached = await watch.execute({ action: 'detach' })
+  assert.deepEqual(
+    detached.watchers.map((entry) => entry.sessionId).sort(),
+    ['session-a', 'session-b'],
+  )
+  assert.equal(detached.watchers.every((entry) => entry.attached === false), true)
+  assert.equal(fake.listeners.size, 0)
+
+  await watch.execute({ action: 'attach', sessionId: 'session-c' })
+  assert.equal(fake.listeners.size, 1)
+  fake.dispose()
+  assert.equal(fake.listeners.size, 0)
+  assert.deepEqual((await watch.execute({ action: 'status' })).watchers, [])
+})
+
+test('eval_watch rejects unknown actions and malformed targets', async () => {
+  const fake = createWatchContext()
+  apply(fake.ctx)
+  const watch = fake.tools.find((tool) => tool.name === 'eval_watch')
+
+  // The tool schema rejects an action outside the enum before execute runs;
+  // runWatchAction keeps an equivalent guard for direct programmatic use.
+  await assert.rejects(
+    watch.execute({ action: 'stop' }),
+    /action/,
+  )
+  await assert.rejects(
+    watch.execute({ action: 'attach' }),
+    (error) => error.code === 'INVALID_SESSION_ID',
+  )
+  await assert.rejects(
+    watch.execute({ action: 'detach', sessionId: '   ' }),
+    (error) => error.code === 'INVALID_SESSION_ID',
+  )
+  assert.equal(fake.listeners.size, 0)
 })

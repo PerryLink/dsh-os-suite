@@ -28,6 +28,14 @@ export {
   signaturePayload,
   verifySignedBundle,
 } from './sign.js'
+export {
+  TRACEPARENT_DEFAULT_FLAGS,
+  TRACEPARENT_VERSION,
+  formatTraceparent,
+  fromTraceparent,
+  parseTraceparent,
+  toTraceparent,
+} from './w3c.js'
 
 export const name = 'dsh-os-trace'
 export const inject = ['tools']

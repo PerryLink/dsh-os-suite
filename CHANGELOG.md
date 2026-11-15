@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.2] - 2026-11-15
+
+### Added
+- `dsh-os-trace`: W3C `traceparent` parsing/formatting; OTLP roundtrip preserves ids/flags.
+- `dsh-os-quota`: token-meter pressure guard and optional job kill (`pressureLimit`/`killJobs`).
+- `dsh-os-eval`: live `session/event` watcher (`eval_watch`).
+- `dsh-os-lease`: monotonic fencing tokens; stale writers fail with `FENCED`.
+
 ## [0.2.1] - 2026-11-15
 
 ### Added

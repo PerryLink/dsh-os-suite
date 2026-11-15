@@ -88,6 +88,20 @@ export function toolNameOf(call) {
 }
 
 /**
+ * Resolve the Session a pre-execute call belongs to. DSH passes a
+ * `ToolExecution` whose live `agent.session` is the durable session; lighter
+ * adapters may hand the session through `call.session` instead.
+ * @param {unknown} call
+ * @returns {object | undefined}
+ */
+export function sessionOfCall(call) {
+  if (!isObject(call)) return undefined
+  if (isObject(call.session)) return call.session
+  if (isObject(call.agent) && isObject(call.agent.session)) return call.agent.session
+  return undefined
+}
+
+/**
  * Clamp an estimated amount to a non-negative finite number. Estimates are not
  * bookings: bad input becomes 0 rather than corrupting the projection.
  * @param {unknown} value
@@ -257,8 +271,16 @@ function createClock(now) {
  *   tools are always ignored.
  * @param {boolean} [options.throwOnDeny=false] Throw a {@link QuotaDeniedError}
  *   instead of returning a denial object. Returning is the DSH-preferred path.
- * @param {boolean} [options.enabled=true] When false, `attach` is a no-op and
- *   `preExecute` delegates immediately.
+ * @param {boolean} [options.enabled=true] When false, the governor gate is
+ *   skipped; the pre-execute hook still attaches when a `pressure` guard is
+ *   configured, so pressure can be enforced on its own.
+ * @param {{ check: (input: { session?: object }) => object }} [options.pressure]
+ *   Optional context-pressure guard from `createPressureGuard`. It runs after
+ *   the governor admission and before `next()`; a denial short-circuits the
+ *   call and is reported as `{ kind: 'deny', allow: false, reason }`.
+ * @param {(call: object) => object | undefined} [options.sessionOf] Optional
+ *   resolver for the Session passed to the pressure guard. Defaults to
+ *   `call.session`, then `call.agent.session` (the DSH `ToolExecution` shape).
  * @param {(() => number | Date) | number | Date} [options.now] Clock override
  *   for status timestamps; intended for tests and embedding.
  * @param {object} [config] Optional second settings object, accepted for hosts
@@ -269,6 +291,7 @@ function createClock(now) {
  *   detach: () => object,
  *   status: () => object,
  *   governor: object,
+ *   readonly pressure: object | null,
  *   readonly attached: boolean,
  *   readonly enabled: boolean,
  * }}
@@ -298,12 +321,21 @@ export function createEnforcer(options = {}, config = undefined) {
     && typeof settings.scope !== 'string' && typeof settings.scope !== 'function') {
     throw new TypeError('scope must be a string or a function')
   }
+  const pressure = settings.pressure ?? null
+  if (pressure !== null && (!isObject(pressure) || typeof pressure.check !== 'function')) {
+    throw new TypeError('pressure must be an object with check({ session })')
+  }
+  if (settings.sessionOf !== undefined && settings.sessionOf !== null
+    && typeof settings.sessionOf !== 'function') {
+    throw new TypeError('sessionOf must be a function')
+  }
 
   const onDeny = settings.onDeny ?? null
   const costOf = settings.costOf ?? null
   const scopeOption = settings.scope ?? null
   const throwOnDeny = settings.throwOnDeny === true
   const enabled = settings.enabled !== false
+  const sessionOf = typeof settings.sessionOf === 'function' ? settings.sessionOf : sessionOfCall
   const clock = createClock(settings.now)
   /** @type {Set<string>} */
   const ignoreNames = new Set(Array.isArray(settings.ignore)
@@ -478,6 +510,35 @@ export function createEnforcer(options = {}, config = undefined) {
   }
 
   /**
+   * Run the configured context-pressure guard. A broken/missing guard fails
+   * open (the governor gate, when enabled, is still authoritative), matching
+   * the adapter's "observability failures must not brick the host" rule.
+   * @param {object} call
+   * @returns {object | null} The denial verdict, or null to allow.
+   */
+  function checkPressure(call) {
+    if (pressure === null) return null
+    let session
+    try {
+      session = sessionOf(call)
+    } catch (error) {
+      counters.errors += 1
+      lastError = errorMessage(error)
+      return null
+    }
+    let verdict
+    try {
+      verdict = pressure.check({ session })
+    } catch (error) {
+      counters.errors += 1
+      lastError = errorMessage(error)
+      return null
+    }
+    if (!isObject(verdict)) return null
+    return verdict.allow === false || verdict.kind === 'deny' ? verdict : null
+  }
+
+  /**
    * The `tools/pre-execute` waterfall listener.
    * @param {object} call
    * @param {() => Promise<unknown>} [next]
@@ -485,7 +546,7 @@ export function createEnforcer(options = {}, config = undefined) {
    */
   async function preExecute(call, next) {
     const proceed = typeof next === 'function' ? next : () => Promise.resolve({ kind: 'allow' })
-    if (!enabled || !isObject(call)) return proceed()
+    if ((!enabled && pressure === null) || !isObject(call)) return proceed()
     const name = toolNameOf(call)
     if (isIgnored(name)) {
       counters.bypassed += 1
@@ -494,46 +555,75 @@ export function createEnforcer(options = {}, config = undefined) {
     }
 
     const scope = resolveScope(call)
-    const cost = estimateCost(call, name)
+    /** @type {object | null} */
+    let decision = null
 
-    let decision
-    try {
-      decision = governor.admit({ scope, ...cost })
-    } catch (error) {
-      // Fail open: a broken estimator/policy must not brick the host.
-      counters.errors += 1
-      lastError = errorMessage(error)
-      recordLast({ kind: 'error', tool: name, scope, error: lastError })
-      return proceed()
-    }
-
-    counters.preExecute += 1
-    if (decision?.level === 'hard' || decision?.allowed === false) {
-      counters.denied += 1
-      const reason = describeDenial(decision, call, name)
-      const denial = new QuotaDeniedError(decision, { reason, call, tool: name })
-      recordLast({ kind: 'deny', tool: name, scope, level: 'hard', reason })
-      if (onDeny !== null) {
-        try {
-          onDeny(decision, call, denial)
-        } catch (error) {
-          counters.errors += 1
-          lastError = errorMessage(error)
-        }
+    if (enabled) {
+      const cost = estimateCost(call, name)
+      try {
+        decision = governor.admit({ scope, ...cost })
+      } catch (error) {
+        // Fail open: a broken estimator/policy must not brick the host. When a
+        // pressure guard is configured, it still gets its independent check.
+        counters.errors += 1
+        lastError = errorMessage(error)
+        recordLast({ kind: 'error', tool: name, scope, error: lastError })
+        if (pressure === null) return proceed()
       }
-      if (throwOnDeny) throw denial
-      return { kind: 'deny', allow: false, reason }
+
+      counters.preExecute += 1
+      if (decision?.level === 'hard' || decision?.allowed === false) {
+        counters.denied += 1
+        const reason = describeDenial(decision, call, name)
+        const denial = new QuotaDeniedError(decision, { reason, call, tool: name })
+        recordLast({ kind: 'deny', tool: name, scope, level: 'hard', reason })
+        if (onDeny !== null) {
+          try {
+            onDeny(decision, call, denial)
+          } catch (error) {
+            counters.errors += 1
+            lastError = errorMessage(error)
+          }
+        }
+        if (throwOnDeny) throw denial
+        return { kind: 'deny', allow: false, reason }
+      }
+    } else {
+      counters.preExecute += 1
     }
 
-    const degraded = decision?.degrade === true || decision?.level === 'soft'
+    if (pressure !== null) {
+      const verdict = checkPressure(call)
+      if (verdict !== null) {
+        counters.denied += 1
+        const reason = nonEmptyString(verdict.reason) ?? 'pressure'
+        const denial = new QuotaDeniedError(
+          isObject(decision) ? decision : { scope, level: 'hard' },
+          { reason, call, tool: name },
+        )
+        recordLast({ kind: 'deny', tool: name, scope, level: 'hard', reason })
+        if (onDeny !== null) {
+          try {
+            onDeny(verdict, call, denial)
+          } catch (error) {
+            counters.errors += 1
+            lastError = errorMessage(error)
+          }
+        }
+        if (throwOnDeny) throw denial
+        return { kind: 'deny', allow: false, reason }
+      }
+    }
+
+    const degraded = enabled && (decision?.degrade === true || decision?.level === 'soft')
     counters.allowed += 1
     if (degraded) counters.degraded += 1
-    rememberCall(call, scope, name)
+    if (enabled) rememberCall(call, scope, name)
     recordLast({
       kind: degraded ? 'degrade' : 'allow',
       tool: name,
       scope,
-      level: decision?.level ?? 'ok',
+      level: isObject(decision) ? decision.level ?? 'ok' : 'ok',
     })
     const downstream = await proceed()
     return degraded ? markDegraded(downstream) : downstream
@@ -684,7 +774,7 @@ export function createEnforcer(options = {}, config = undefined) {
    * @returns {object} The enforcer, for chaining.
    */
   function attach(ctx) {
-    if (!enabled) return enforcer
+    if (!enabled && pressure === null) return enforcer
     if (!isObject(ctx)) throw new TypeError('attach(ctx) requires a context object')
     if (attached && attachedCtx === ctx) return enforcer
     if (attached) detach()
@@ -696,12 +786,14 @@ export function createEnforcer(options = {}, config = undefined) {
 
     if (on !== null) {
       registered.push(subscribe(on, 'tools/pre-execute', preHandler))
-      registered.push(subscribe(on, 'tools/result', onToolResult))
-      // The task brief names the singular event; hosts that expose it get the
-      // same handler. It is inert (never fired) on a stock DSH event bus.
-      registered.push(subscribe(on, 'tool/result', onToolResult))
-      // DSH's durable `tool/result` is a session event, not a Cordis event.
-      registered.push(subscribe(on, 'session/event', onSessionEvent))
+      if (enabled) {
+        registered.push(subscribe(on, 'tools/result', onToolResult))
+        // The task brief names the singular event; hosts that expose it get the
+        // same handler. It is inert (never fired) on a stock DSH event bus.
+        registered.push(subscribe(on, 'tool/result', onToolResult))
+        // DSH's durable `tool/result` is a session event, not a Cordis event.
+        registered.push(subscribe(on, 'session/event', onSessionEvent))
+      }
     }
     if (!hookFlags.preExecute && isObject(ctx.tools) && typeof ctx.tools.preExecute === 'function') {
       registered.push(subscribeToolsPre(ctx.tools, preHandler))
@@ -713,7 +805,7 @@ export function createEnforcer(options = {}, config = undefined) {
     else {
       lastError = 'no tools/pre-execute hook available on this context'
       if (isObject(ctx.logger) && typeof ctx.logger.warn === 'function') {
-        ctx.logger.warn(`[dsh-os-quota] enforce=true but ${lastError}`)
+        ctx.logger.warn(`[dsh-os-quota] ${lastError}; the gate is configured but inert`)
       }
     }
     return enforcer
@@ -757,11 +849,14 @@ export function createEnforcer(options = {}, config = undefined) {
         ignore: [...ignoreNames],
         quotaToolsIgnored: true,
         throwOnDeny,
+        pressure: pressure !== null,
+        governor: enabled,
       },
       counters: { ...counters },
       last: last === null ? null : { ...last },
       lastError,
       pending: pendingCalls.size,
+      pressure: pressure === null ? null : pressure.status(),
     }
   }
 
@@ -781,6 +876,7 @@ export function createEnforcer(options = {}, config = undefined) {
     detach,
     status,
     governor,
+    get pressure() { return pressure },
     get attached() { return attached },
     get enabled() { return enabled },
   }

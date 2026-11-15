@@ -37,7 +37,7 @@ when agents must share one workspace safely.
 
 ## Install
 
-The package is **published as `dsh-os-lease@0.2.1`**. From npm:
+The package is **published as `dsh-os-lease@0.2.2`**. From npm:
 
 ```sh
 npm install
@@ -141,36 +141,47 @@ The same snapshot is available from `manager.status()`.
 `src/apply.js` (published as the `dsh-os-lease/apply` subpath) exports the
 executor for hosts that want the same behavior without the tool layer:
 
-- `applyPatchset(patchset, { root, verifyBefore?, lockProvider?, lockTtlMs?, lockOwner? })`
-  → journal
+- `applyPatchset(patchset, { root, verifyBefore?, lockProvider?, lockTtlMs?, lockOwner?, fence? })`
+  → journal (fenced when the provider issues tokens; `fence` reuses a token
+  the caller acquired itself)
 - `readJournal(id, { root })` → parsed journal manifest
-- `rollback(journalPathOrJournal, { root? })` → rollback summary
+- `rollback(journalPathOrJournal, { root?, fence?, fencePath? })` → rollback
+  summary (fenced only when `fence` is supplied)
+- `assertFence(root, fence, { provider?, fencePath? })` → current counter;
+  throws `FENCED` for a stale token
 
 The journal lives at
 `<root>/.dsh-os-lease/journal/<id>/journal.json`; pre-images live in
 `<root>/.dsh-os-lease/journal/<id>/backups/`. The manifest records paths,
 existence, modes, sizes, and SHA-256 hashes, but not file bodies. Failures throw
 `ApplyError` with a stable `code` such as `INVALID_PATH`, `PATH_ESCAPE`,
-`LOCKED`, `ALREADY_APPLIED`, `BACKUP_MISSING`, or `ROLLBACK_FAILED`. A `LOCKED`
-error carries `details.owner` and `details.expiresAt` (`null` when the record
-has no expiry) so the caller can decide whether to wait or inspect the holder.
+`LOCKED`, `FENCED`, `ALREADY_APPLIED`, `BACKUP_MISSING`, or `ROLLBACK_FAILED`.
+A `LOCKED` error carries `details.owner` and `details.expiresAt` (`null` when
+the record has no expiry) so the caller can decide whether to wait or inspect
+the holder. `FENCED` carries `details.fence` and `details.current`; the journal
+remains on disk if a newer holder appeared mid-apply.
 
 ### Lock providers
 
 Before writing, `applyPatchset` takes one lock per normalized path through a
 provider (published as the `dsh-os-lease/lock` subpath):
 
-- `FileLockProvider({ dir })` — one JSON lock file per key, created with
-  `wx`, containing `owner`, `token`, and `expiresAt`. Expired records are
-  reclaimed after `expiresAt`. This is the default, with
-  `dir = <root>/.dsh-os-lease/locks`.
-- `MemoryLockProvider` — same contract in a `Map`; for tests and
-  single-process embedding only. Two instances do not share state.
-- `LockProvider` — the interface (`acquire`, `renew`, `release`, `inspect`) for
-  custom adapters. `withLock(provider, key, fn, { ttlMs?, owner? })` wraps a
-  callback and releases on success and on throw. Redis/SQL/etcd adapters are
-  intentionally not shipped; `docs/cross-host-locks.md` sketches the interface
-  only, with the relevant clock and fencing caveats.
+- `FileLockProvider({ dir, fencePath? })` — one JSON lock file per key,
+  created with `wx`, containing `owner`, `token`, `fence`, and `expiresAt`.
+  Expired records are reclaimed after `expiresAt`. A successful acquire also
+  bumps the monotonic counter in `fencePath` (default `<dir>/fence`) with
+  read-increment-atomic-rename. This is the default, with
+  `dir = <root>/.dsh-os-lease/locks` and
+  `fencePath = <root>/.dsh-os-lease/fence`.
+- `MemoryLockProvider` — same contract in a `Map`, including an in-process
+  fence counter; for tests and single-process embedding only. Two instances do
+  not share state.
+- `LockProvider` — the interface (`acquire`, `renew`, `release`, `inspect`,
+  plus optional `currentFence`) for custom adapters.
+  `withLock(provider, key, fn, { ttlMs?, owner? })` wraps a callback and
+  releases on success and on throw. Redis/SQL/etcd adapters are intentionally
+  not shipped; `docs/cross-host-locks.md` sketches the interface only, with the
+  relevant clock and fencing caveats.
 
 ```js
 import { applyPatchset } from 'dsh-os-lease/apply'
@@ -178,11 +189,17 @@ import { FileLockProvider } from 'dsh-os-lease/lock'
 
 const lockProvider = new FileLockProvider({ dir: '/srv/shared/.dsh-os-lease/locks' })
 
+// Fence this apply with a token the caller already holds. Without `fence`,
+// applyPatchset uses the token issued by its own path-lock acquisitions.
+const lease = await lockProvider.acquire('src/app.js', { owner: 'host-a/agent-7' })
+await lockProvider.release(lease)
+
 await applyPatchset(patchset, {
   root: '/srv/shared/workspace',
   lockProvider,
   lockTtlMs: 15 * 60 * 1000,
   lockOwner: 'host-a/agent-7',
+  fence: lease.fence,
 })
 ```
 
@@ -194,10 +211,14 @@ hosts **only when the lock directory is on a shared filesystem (NFS/SMB) that
 honours atomic `O_EXCL` create and rename, with bounded clock skew**. Cross-host
 coordination therefore requires either that shared filesystem or a custom
 `lockProvider` backed by a shared service; the built-in local default does not
-cross hosts. It is a time-based lease: it is **not a strong distributed lock**,
-has no fencing token, and is unsupported on FUSE/cloud-sync mounts. The full
-conditions, clock-skew math, TTL guidance, and Redis/SQL interface sketches are
-in [`docs/cross-host-locks.md`](docs/cross-host-locks.md).
+cross hosts. It is a time-based lease, **not a strong distributed lock**. Each
+acquire issues a monotonic fencing token, and `applyPatchset`/`rollback` refuse
+a write whose token is older than the current fence (`FENCED`). That check is
+compare-then-write: it catches a holder that was already superseded, but **not**
+a holder paused between its fence check and the write. It is unsupported on
+FUSE/cloud-sync mounts. The full conditions, clock-skew math, TTL guidance,
+fencing limits, and Redis/SQL interface sketches are in
+[`docs/cross-host-locks.md`](docs/cross-host-locks.md).
 
 Typical flow:
 
@@ -250,8 +271,11 @@ Typical flow:
   processes on the **same host and filesystem**; across hosts it is only
   plausible when that directory is on a shared NFSv4/SMB 3.x mount with working
   atomic `O_EXCL` create and rename, coherent directory caching, and clocks
-  whose skew is far below the TTL. It is not linearizable, has no fencing
-  token, and is unsupported on FUSE/cloud-sync mounts. A crashed process leaves
+  whose skew is far below the TTL. It is not linearizable. Fencing rejects a
+  write after a newer token became visible, but cannot prevent a writer that
+  was paused between its fence check and its write, so it is not a substitute
+  for an external store that applies the compare-and-write atomically. It is
+  unsupported on FUSE/cloud-sync mounts. A crashed process leaves
   a lock until its TTL expires; locks without an `expiresAt` (created by older
   versions) must be removed manually after confirming no apply is running. Use
   a custom provider for stronger semantics. See
@@ -314,18 +338,20 @@ repository names can be claimed at any time.
 node --test packages/dsh-os-lease/test/*.test.js
 ```
 
-51 tests cover leases (acquire/release, TTL expiry, prefix conflicts, workspace
+63 tests cover leases (acquire/release, TTL expiry, prefix conflicts, workspace
 isolation, lease lifetime at commit), patchset planning (prepare/commit
 sorting, duplicate transitions, prepared-patchset overlap, status counts), the
 lock layer (acquire/conflict/expiry-reclaim/release/renew/`withLock` on both
 `FileLockProvider` and `MemoryLockProvider`, token-checked stale handles, two
 file providers sharing one directory, legacy lock files without expiry,
-concurrent acquirers, and custom-provider config wiring), and the applier
+concurrent acquirers, monotonic fences, stale candidate reclaim, malformed
+fence files, and custom-provider config wiring), and the applier
 (write/read journals, atomic mode-preserving
 replacement, path and symlink escape rejection, rollback restore/delete,
 idempotent rollback, missing backup errors, duplicate journal ids, default and
 injected per-path lock providers with `owner`/`expiresAt` in `LOCKED`,
-`verifyBefore`, and the dry-run/apply/rollback tool wiring).
+`verifyBefore`, stale/current fences on apply and rollback, per-write fence
+re-checks, and the dry-run/apply/rollback tool wiring).
 
 ## License
 

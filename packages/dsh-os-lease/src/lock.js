@@ -19,10 +19,16 @@
  *   a SQL database, etcd, or a lock service can implement it and pass the
  *   provider to `applyPatchset`; this package does not ship those adapters.
  *
- * These are *leases*, not linearizable distributed locks. TTL decisions use a
- * local clock, reclaim is best effort, and there is no fencing token enforced
- * by the target filesystem. Read `docs/cross-host-locks.md` before relying on
- * cross-host exclusion.
+ * Each successful `acquire` also issues a **monotonic fencing token**
+ * (`handle.fence`). `FileLockProvider` keeps the counter in a `fence` file and
+ * allocates the next value with read-increment-atomic-rename; `MemoryLockProvider`
+ * uses an in-process counter. The token is only a number: the target
+ * filesystem does not enforce it. `applyPatchset`/`rollback` compare it with
+ * the current fence file before each target write and refuse a stale token
+ * with `FENCED`. That catches "a newer token was already visible before this
+ * write"; it cannot stop a holder that was paused between its fence check and
+ * its write. Read `docs/cross-host-locks.md` before relying on cross-host
+ * exclusion.
  */
 
 import { createHash, randomBytes } from 'node:crypto'
@@ -36,6 +42,8 @@ export const LOCK_ERROR_CODES = Object.freeze({
   LOCK_EXPIRED: 'LOCK_EXPIRED',
   LOCK_LOST: 'LOCK_LOST',
   LOCK_FAILED: 'LOCK_FAILED',
+  FENCED: 'FENCED',
+  FENCE_FAILED: 'FENCE_FAILED',
   NOT_IMPLEMENTED: 'NOT_IMPLEMENTED',
 })
 
@@ -45,8 +53,25 @@ export const DEFAULT_LOCK_TTL_MS = 900_000
 /** On-disk lock record version. */
 export const LOCK_VERSION = 1
 
+/** Basename of the fencing counter, relative to `FileLockProvider#dir` by default. */
+export const FENCE_FILE_NAME = 'fence'
+
 /** How often an acquire may retry after reclaiming or losing a stale file. */
 const MAX_ACQUIRE_ATTEMPTS = 5
+
+/** Bound on the read-increment-rename retry loop for fence allocation. */
+const MAX_FENCE_ATTEMPTS = 200
+
+/** Delay between fence allocation retries, in milliseconds. */
+const FENCE_RETRY_DELAY_MS = 2
+
+/**
+ * A `.next-<n>` candidate older than this is assumed to belong to a crashed
+ * allocator and may be removed. Reclaiming a candidate from a live-but-paused
+ * allocator is safe: the paused allocator's rename then fails with `ENOENT`
+ * and it retries with the newer counter value.
+ */
+const FENCE_CANDIDATE_STALE_MS = 30_000
 
 /**
  * Error thrown by lock providers.
@@ -78,6 +103,9 @@ export class LockError extends Error {
  * @property {string} key Locked key.
  * @property {string} owner Caller-supplied owner label.
  * @property {string} token Capability token; required by `renew`/`release`.
+ * @property {number | null} fence Monotonic fencing token issued by this
+ *   acquire, or `null` when the provider does not issue one. Pass it to
+ *   `applyPatchset({ fence })` / `rollback(journal, { fence })`.
  * @property {number} expiresAt Epoch milliseconds; the lock is reclaimable at
  *   or after this instant.
  * @property {number} acquiredAt Epoch milliseconds.
@@ -96,6 +124,7 @@ export class LockError extends Error {
  *   by the next acquirer. It is never `true` when `locked` is `false`.
  * @property {number | null} acquiredAt
  * @property {number | null} renewedAt
+ * @property {number | null} [fence] Fencing token recorded with the lock.
  * @property {number | null} [pid] Process id recorded by the file provider.
  * @property {string} [lockPath]
  */
@@ -192,7 +221,7 @@ function normalizeTtl(value, fallback = DEFAULT_LOCK_TTL_MS) {
 
 /**
  * @param {unknown} options
- * @returns {{ ttlMs: number, owner: string }}
+ * @returns {{ ttlMs: number, owner: string, issueFence: boolean }}
  */
 function normalizeAcquireOptions(options) {
   if (options === null || typeof options !== 'object' || Array.isArray(options)) {
@@ -201,9 +230,18 @@ function normalizeAcquireOptions(options) {
       'acquire options must be an object',
     )
   }
+  if (options.issueFence !== undefined && typeof options.issueFence !== 'boolean') {
+    throw new LockError(
+      LOCK_ERROR_CODES.INVALID_ARGUMENT,
+      'acquire options.issueFence must be a boolean when present',
+    )
+  }
   return {
     ttlMs: normalizeTtl(options.ttlMs),
     owner: normalizeOwner(options.owner),
+    // `issueFence: false` acquires mutual exclusion without consuming a token.
+    // `applyPatchset` uses it when the caller already supplied a fence.
+    issueFence: options.issueFence !== false,
   }
 }
 
@@ -235,6 +273,7 @@ function makeHandle(input) {
     key: input.key,
     owner: input.owner,
     token: input.token,
+    fence: Number.isSafeInteger(input.fence) && input.fence >= 0 ? input.fence : null,
     expiresAt: input.expiresAt,
     acquiredAt: input.acquiredAt,
     renewedAt: input.renewedAt ?? null,
@@ -277,6 +316,8 @@ function parseLockRecord(raw) {
   return {
     owner: typeof record.owner === 'string' && record.owner !== '' ? record.owner : null,
     token: typeof record.token === 'string' && record.token !== '' ? record.token : null,
+    fence:
+      Number.isSafeInteger(record.fence) && record.fence >= 0 ? record.fence : null,
     expiresAt: toEpochMs(record.expiresAt),
     acquiredAt: toEpochMs(record.acquiredAt),
     renewedAt: toEpochMs(record.renewedAt),
@@ -391,6 +432,179 @@ async function ensureLockDirectory(dir) {
 }
 
 /**
+ * Read the fencing counter at `fencePath`. A missing file is `0` (no token has
+ * been issued yet). A file whose body is not a non-negative safe integer is an
+ * error: silently treating it as `0` would disable fencing.
+ *
+ * @param {string} fencePath
+ * @returns {Promise<number>}
+ */
+export async function readFenceValue(fencePath) {
+  let raw
+  try {
+    raw = await fs.readFile(fencePath, 'utf8')
+  } catch (error) {
+    if (error instanceof Error && error.code === 'ENOENT') return 0
+    throw new LockError(
+      LOCK_ERROR_CODES.FENCE_FAILED,
+      `cannot read fence file "${fencePath}": ${messageOf(error)}`,
+      { fencePath, cause: error instanceof Error ? error.code : undefined },
+    )
+  }
+  const text = raw.trim()
+  const value = text === '' ? Number.NaN : Number(text)
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new LockError(
+      LOCK_ERROR_CODES.FENCE_FAILED,
+      `fence file "${fencePath}" does not contain a non-negative integer`,
+      { fencePath, value: text.slice(0, 64) },
+    )
+  }
+  return value
+}
+
+/** @param {number} ms */
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/**
+ * fsync a directory so a completed rename survives a system crash. Several
+ * platforms (Windows, some network filesystems) refuse to open a directory for
+ * fsync; that failure is ignored.
+ *
+ * @param {string} directory
+ */
+async function syncDirectoryBestEffort(directory) {
+  let handle = null
+  try {
+    handle = await fs.open(directory, 'r')
+    await handle.sync()
+  } catch {
+    // Best effort only; the rename is still atomic.
+  } finally {
+    if (handle !== null) {
+      try {
+        await handle.close()
+      } catch {
+        // Nothing useful to do.
+      }
+    }
+  }
+}
+
+/**
+ * Remove a crashed allocator's `.next-<n>` candidate once it is old enough.
+ * Failure is ignored: the retry loop will report a useful error if the
+ * candidate stays in the way.
+ *
+ * @param {string} candidate
+ */
+async function reclaimStaleFenceCandidate(candidate) {
+  let stat
+  try {
+    stat = await fs.lstat(candidate)
+  } catch {
+    return
+  }
+  if (Date.now() - stat.mtimeMs < FENCE_CANDIDATE_STALE_MS) return
+  try {
+    await fs.unlink(candidate)
+  } catch {
+    // Another reclaimer won, or the owner renamed it first.
+  }
+}
+
+/**
+ * Allocate the next fencing token in `fencePath`.
+ *
+ * The counter is read, incremented, written to a deterministic candidate
+ * `<fencePath>.next-<n>`, and atomically renamed over `fencePath`. The `wx`
+ * create of the candidate is what serializes two concurrent allocators: both
+ * may read `n`, but only one can create `.next-<n+1>`; the other retries after
+ * the rename becomes visible and allocates `n+2`. The token value is never
+ * handed out twice, even though the read and the rename are separate syscalls.
+ * Gaps are possible when an allocator fails after creating a candidate.
+ *
+ * @param {string} fencePath
+ * @returns {Promise<number>}
+ */
+export async function allocateFence(fencePath) {
+  for (let attempt = 0; attempt < MAX_FENCE_ATTEMPTS; attempt += 1) {
+    const current = await readFenceValue(fencePath)
+    const next = current + 1
+    if (!Number.isSafeInteger(next)) {
+      throw new LockError(
+        LOCK_ERROR_CODES.FENCE_FAILED,
+        `fence counter at "${fencePath}" is exhausted`,
+        { fencePath },
+      )
+    }
+    const candidate = `${fencePath}.next-${next}`
+    let created = false
+    try {
+      const handle = await fs.open(candidate, 'wx', 0o600)
+      try {
+        await handle.writeFile(`${next}\n`)
+        await handle.sync()
+      } finally {
+        await handle.close().catch(() => {})
+      }
+      created = true
+    } catch (error) {
+      if (!(error instanceof Error) || error.code !== 'EEXIST') {
+        // A partial candidate may exist (open succeeded, write/sync failed);
+        // remove it so this value is not blocked until the stale timeout.
+        await fs.unlink(candidate).catch(() => {})
+        throw new LockError(
+          LOCK_ERROR_CODES.FENCE_FAILED,
+          `cannot allocate fence candidate "${candidate}": ${messageOf(error)}`,
+          { fencePath, cause: error instanceof Error ? error.code : undefined },
+        )
+      }
+      await reclaimStaleFenceCandidate(candidate)
+    }
+    if (!created) {
+      await sleep(FENCE_RETRY_DELAY_MS)
+      continue
+    }
+    // Re-read after creating the candidate. If the counter already reached
+    // `next`, our read was stale and this candidate is a *second* copy of an
+    // already-published value (another allocator can create it once our
+    // predecessor renamed its own candidate away). Aborting here is what
+    // makes duplicate tokens impossible.
+    const observed = await readFenceValue(fencePath)
+    if (observed >= next) {
+      await fs.unlink(candidate).catch(() => {})
+      await sleep(FENCE_RETRY_DELAY_MS)
+      continue
+    }
+    try {
+      await fs.rename(candidate, fencePath)
+      await syncDirectoryBestEffort(path.dirname(fencePath))
+      return next
+    } catch (error) {
+      // A stale-candidate reclaimer removed our file; retry from the counter.
+      if (error instanceof Error && error.code === 'ENOENT') {
+        await sleep(FENCE_RETRY_DELAY_MS)
+        continue
+      }
+      await fs.unlink(candidate).catch(() => {})
+      throw new LockError(
+        LOCK_ERROR_CODES.FENCE_FAILED,
+        `cannot publish fence "${candidate}": ${messageOf(error)}`,
+        { fencePath, cause: error instanceof Error ? error.code : undefined },
+      )
+    }
+  }
+  throw new LockError(
+    LOCK_ERROR_CODES.FENCE_FAILED,
+    `cannot allocate a fence token at "${fencePath}" after ${MAX_FENCE_ATTEMPTS} attempts`,
+    { fencePath },
+  )
+}
+
+/**
  * Lock provider interface.
  *
  * Implementations must be safe to share between concurrent callers in one
@@ -400,8 +614,13 @@ async function ensureLockDirectory(dir) {
  * handle's token so an expired holder cannot release a lock that a newer
  * owner has since acquired.
  *
+ * Providers may also issue a monotonic `handle.fence` and expose
+ * `currentFence()` so the applier can reject stale holders. Providers that do
+ * not are still usable; `applyPatchset` falls back to the root fence file (see
+ * `docs/cross-host-locks.md`).
+ *
  * The base class only documents the contract; subclass it or provide a
- * duck-typed object with the same four methods.
+ * duck-typed object with the same methods.
  */
 export class LockProvider {
   #clock
@@ -446,7 +665,7 @@ export class LockProvider {
 
   /**
    * @param {string} _key
-   * @param {{ ttlMs?: number, owner: string }} _options
+   * @param {{ ttlMs?: number, owner: string, issueFence?: boolean }} _options
    * @returns {Promise<LockHandle>}
    */
   async acquire(_key, _options) {
@@ -477,6 +696,20 @@ export class LockProvider {
   async inspect(_key) {
     throw new LockError(LOCK_ERROR_CODES.NOT_IMPLEMENTED, 'LockProvider.inspect is abstract')
   }
+
+  /**
+   * Current fencing counter, or `0` when the provider has never issued a
+   * token. Providers without fencing may keep the default (which throws);
+   * `applyPatchset` then verifies against the root fence file instead.
+   *
+   * @returns {Promise<number>}
+   */
+  async currentFence() {
+    throw new LockError(
+      LOCK_ERROR_CODES.NOT_IMPLEMENTED,
+      'LockProvider.currentFence is abstract',
+    )
+  }
 }
 
 /**
@@ -492,13 +725,18 @@ export class LockProvider {
  * contents are re-read immediately before the rename to keep the window for
  * accidentally moving a just-reacquired lock small. That window is not zero:
  * this is a best-effort lease, not a linearizable lock.
+ *
+ * Fencing lives in a separate counter file (`fencePath`, default
+ * `<dir>/fence`). It is a plain decimal integer and is bumped by every
+ * successful acquire; see {@link allocateFence}.
  */
 export class FileLockProvider extends LockProvider {
   #dir
+  #fencePath
   #ready
 
   /**
-   * @param {{ dir: string, clock?: () => number }} options
+   * @param {{ dir: string, clock?: () => number, fencePath?: string }} options
    */
   constructor(options = {}) {
     super(options)
@@ -508,7 +746,20 @@ export class FileLockProvider extends LockProvider {
         'FileLockProvider requires a non-empty dir',
       )
     }
+    if (
+      options.fencePath !== undefined &&
+      (typeof options.fencePath !== 'string' || options.fencePath.trim() === '')
+    ) {
+      throw new LockError(
+        LOCK_ERROR_CODES.INVALID_ARGUMENT,
+        'FileLockProvider fencePath must be a non-empty string when present',
+      )
+    }
     this.#dir = path.resolve(options.dir)
+    this.#fencePath =
+      options.fencePath === undefined
+        ? path.join(this.#dir, FENCE_FILE_NAME)
+        : path.resolve(options.fencePath)
     /** @type {Promise<void> | null} */
     this.#ready = null
   }
@@ -523,6 +774,11 @@ export class FileLockProvider extends LockProvider {
     return this.#dir
   }
 
+  /** @returns {string} Absolute path of the fencing counter. */
+  get fencePath() {
+    return this.#fencePath
+  }
+
   /**
    * @param {string} key
    * @returns {string}
@@ -534,7 +790,11 @@ export class FileLockProvider extends LockProvider {
   /** @returns {Promise<void>} */
   async #ensureDirectory() {
     if (this.#ready === null) {
-      this.#ready = ensureLockDirectory(this.#dir).catch((error) => {
+      this.#ready = (async () => {
+        await ensureLockDirectory(this.#dir)
+        const fenceDir = path.dirname(this.#fencePath)
+        if (fenceDir !== this.#dir) await ensureLockDirectory(fenceDir)
+      })().catch((error) => {
         this.#ready = null
         throw error
       })
@@ -544,7 +804,7 @@ export class FileLockProvider extends LockProvider {
 
   /**
    * @param {string} key
-   * @param {{ ttlMs?: number, owner: string }} options
+   * @param {{ ttlMs?: number, owner: string, issueFence?: boolean }} options
    * @returns {Promise<LockHandle>}
    */
   async acquire(key, options = {}) {
@@ -616,12 +876,19 @@ export class FileLockProvider extends LockProvider {
       }
 
       try {
+        // The fence is allocated while the lock file is exclusively ours, so
+        // no other successful acquire for this key can interleave. A failure
+        // releases the path instead of leaving an unusable lock behind.
+        record.fence = settings.issueFence
+          ? await allocateFence(this.#fencePath)
+          : await this.currentFence()
         await handle.writeFile(`${JSON.stringify(record)}\n`)
         await handle.sync()
       } catch (error) {
         await handle.close().catch(() => {})
         handle = null
         await fs.unlink(lockPath).catch(() => {})
+        if (error instanceof LockError) throw error
         throw new LockError(
           LOCK_ERROR_CODES.LOCK_FAILED,
           `cannot write lock file "${lockPath}": ${messageOf(error)}`,
@@ -697,6 +964,10 @@ export class FileLockProvider extends LockProvider {
         key,
         owner: typeof handle.owner === 'string' ? handle.owner : record.owner,
         token,
+        fence:
+          Number.isSafeInteger(handle.fence) && handle.fence >= 0
+            ? handle.fence
+            : record.fence,
         pid: typeof record.pid === 'number' ? record.pid : process.pid,
         acquiredAt: record.acquiredAt ?? now,
         renewedAt: now,
@@ -743,6 +1014,10 @@ export class FileLockProvider extends LockProvider {
       key,
       owner: typeof handle.owner === 'string' ? handle.owner : observed.owner ?? 'unknown',
       released: true,
+      fence:
+        Number.isSafeInteger(handle.fence) && handle.fence >= 0
+          ? handle.fence
+          : observed.fence,
       expiresAt: observed.expiresAt,
     })
   }
@@ -764,6 +1039,7 @@ export class FileLockProvider extends LockProvider {
         expired: false,
         acquiredAt: null,
         renewedAt: null,
+        fence: null,
         lockPath,
       })
     }
@@ -775,9 +1051,20 @@ export class FileLockProvider extends LockProvider {
       expired: observed.expired,
       acquiredAt: observed.acquiredAt,
       renewedAt: observed.renewedAt,
+      fence: observed.fence,
       pid: observed.pid,
       lockPath,
     })
+  }
+
+  /**
+   * Read the on-disk fencing counter. A missing file means no token has ever
+   * been issued in this directory.
+   *
+   * @returns {Promise<number>}
+   */
+  async currentFence() {
+    return readFenceValue(this.#fencePath)
   }
 }
 
@@ -789,22 +1076,29 @@ export class FileLockProvider extends LockProvider {
  * filesystem or a custom provider for that.
  */
 export class MemoryLockProvider extends LockProvider {
-  /** @type {Map<string, { key: string, owner: string, token: string, expiresAt: number, acquiredAt: number, renewedAt: number | null }>} */
+  /** @type {Map<string, { key: string, owner: string, token: string, fence: number, expiresAt: number, acquiredAt: number, renewedAt: number | null }>} */
   #locks = new Map()
+
+  /**
+   * Monotonic in-process fencing counter. It is deliberately *not* reset by
+   * {@link clear}: a token that was handed out must never be reissued.
+   * @type {number}
+   */
+  #fence = 0
 
   /** @returns {'memory'} */
   get kind() {
     return 'memory'
   }
 
-  /** Drop every lock. Intended for test cleanup. */
+  /** Drop every lock. Intended for test cleanup. The fence counter is kept. */
   clear() {
     this.#locks.clear()
   }
 
   /**
    * @param {string} key
-   * @param {{ ttlMs?: number, owner: string }} options
+   * @param {{ ttlMs?: number, owner: string, issueFence?: boolean }} options
    * @returns {Promise<LockHandle>}
    */
   async acquire(key, options = {}) {
@@ -815,10 +1109,20 @@ export class MemoryLockProvider extends LockProvider {
     if (existing !== undefined && now < existing.expiresAt) {
       throw lockedError(safeKey, undefined, { ...existing, exists: true })
     }
+    if (settings.issueFence) {
+      if (!Number.isSafeInteger(this.#fence + 1)) {
+        throw new LockError(
+          LOCK_ERROR_CODES.FENCE_FAILED,
+          'memory fence counter is exhausted',
+        )
+      }
+      this.#fence += 1
+    }
     const record = {
       key: safeKey,
       owner: settings.owner,
       token: randomToken(),
+      fence: this.#fence,
       expiresAt: now + settings.ttlMs,
       acquiredAt: now,
       renewedAt: null,
@@ -867,6 +1171,7 @@ export class MemoryLockProvider extends LockProvider {
       key,
       owner: existing.owner,
       released: true,
+      fence: existing.fence,
       expiresAt: existing.expiresAt,
     })
   }
@@ -887,6 +1192,7 @@ export class MemoryLockProvider extends LockProvider {
         expired: false,
         acquiredAt: null,
         renewedAt: null,
+        fence: null,
       })
     }
     return Object.freeze({
@@ -897,7 +1203,17 @@ export class MemoryLockProvider extends LockProvider {
       expired: this.now() >= existing.expiresAt,
       acquiredAt: existing.acquiredAt,
       renewedAt: existing.renewedAt,
+      fence: existing.fence,
     })
+  }
+
+  /**
+   * Latest fence issued by this provider instance.
+   *
+   * @returns {Promise<number>}
+   */
+  async currentFence() {
+    return this.#fence
   }
 }
 

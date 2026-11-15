@@ -8,6 +8,8 @@
  * The default format is this package's v1 evidence bundle. `--format otlp`
  * switches export to OTLP/JSON, or tells import to read OTLP/JSON. Importing
  * always emits a freshly sealed v1 bundle because the CLI process is the store.
+ * `--traceparent` switches export to newline-delimited W3C header lines and
+ * tells import to read such lines; it is not full W3C context propagation.
  */
 
 import { readFileSync, realpathSync, writeFileSync } from 'node:fs'
@@ -16,6 +18,7 @@ import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 import { createTraceStore, verifyBundle } from './core.js'
 import { fromOtlp, toOtlp } from './otlp.js'
+import { formatTraceparent, fromTraceparent, parseTraceparent } from './w3c.js'
 
 /** @type {string} */
 let VERSION = '0.0.0'
@@ -32,35 +35,43 @@ const USAGE = `dsh-os-trace ${VERSION} - causal trace and OTLP/JSON interop
 
 Usage:
   dsh-os-trace trace_export [input] [--format bundle|otlp] [--out <file>] [--service-name <name>]
+  dsh-os-trace trace_export [input] --format otlp --traceparent [--out <file>]
   dsh-os-trace trace_import <input> --format otlp [--out <file>]
   dsh-os-trace trace_import <input> [--format bundle] [--out <file>]
+  dsh-os-trace trace_import <input> --traceparent [--out <file>]
   dsh-os-trace export ...   (alias)
   dsh-os-trace import ...   (alias)
 
 Commands:
   trace_export  Read a v1 bundle, OTLP/JSON document, span array or JSONL and
                 emit a v1 bundle (default) or an OTLP/JSON document.
-  trace_import  Read a v1 bundle or OTLP/JSON document into a fresh in-memory
-                store and emit the resulting v1 bundle.
+  trace_import  Read a v1 bundle, OTLP/JSON document or traceparent header file
+                into a fresh in-memory store and emit the resulting v1 bundle.
 
 Options:
   --format <bundle|otlp>  Output format for export, input format for import.
                           Default: bundle.
-  --out <file>            Write JSON to this file instead of stdout.
+  --out <file>            Write output to this file instead of stdout.
   --service-name <name>   service.name resource attribute for OTLP export.
                           Default: dsh.
+  --traceparent           Export (with --format otlp): write one W3C
+                          traceparent header per span instead of JSON.
+                          Import: read <input> as one traceparent header per
+                          non-empty line instead of a bundle/OTLP document.
   -h, --help              Show this help.
   -V, --version           Show the version.
 
 Input:
   Omit <input> for export, or pass "-", to read stdin. An empty input produces
   an empty export. JSONL is accepted for export when the input is not one JSON
-  document.
+  document. Traceparent input is newline-delimited; blank lines are ignored.
 
 Limits:
-  OTLP/JSON only: no OTLP/gRPC, protobuf, OTel SDK, collector or W3C trace
-  context propagation. Imported spans are re-sealed into this package's own
-  SHA-256 chain; OTLP has no equivalent of that chain or its HMAC signature.
+  OTLP/JSON only; W3C traceparent strings are supported as an optional id/flags
+  carrier, but there is no full W3C trace context propagation, OTLP/gRPC,
+  protobuf, OTel SDK or collector. Imported spans are re-sealed into this
+  package's own SHA-256 chain; OTLP has no equivalent of that chain or its HMAC
+  signature.
 
 Exit codes: 0 success, 2 bad arguments/input/IO.
 `
@@ -197,6 +208,51 @@ function readImportBundle(text, label) {
 }
 
 /**
+ * Read newline-delimited W3C `traceparent` headers into span inputs.
+ *
+ * A header carries only trace/span ids and trace flags: there is no name,
+ * kind, timestamp or parent id. The CLI therefore creates one `workflow` span
+ * per header named `traceparent-<n>`, with `sessionId = traceId` and the
+ * canonical header kept in `attrs.traceparent`. Parent relationships must come
+ * from a bundle or OTLP document, not from this format.
+ *
+ * @param {string} text
+ * @returns {import('./core.js').SpanInput[]}
+ */
+function readTraceparentSpans(text) {
+  const lines = stripBom(text).split(/\r?\n/)
+  const startMs = Date.now()
+  /** @type {import('./core.js').SpanInput[]} */
+  const spans = []
+  const seen = new Set()
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index].trim()
+    if (line.length === 0) continue
+    const parsed = parseTraceparent(line)
+    if (parsed === null) {
+      fail(`input line ${index + 1} is not a valid W3C traceparent header`)
+    }
+    if (seen.has(parsed.spanId)) {
+      fail(`input line ${index + 1} repeats span id "${parsed.spanId}"`)
+    }
+    seen.add(parsed.spanId)
+    const header = formatTraceparent(parsed)
+    const base = fromTraceparent(header, { name: `traceparent-${spans.length + 1}` })
+    if (base === null) fail(`input line ${index + 1} is not a valid W3C traceparent header`)
+    spans.push({
+      id: base.spanId,
+      sessionId: base.traceId,
+      kind: 'workflow',
+      name: base.name,
+      startMs,
+      status: 'running',
+      attrs: { traceparent: header },
+    })
+  }
+  return spans
+}
+
+/**
  * @param {unknown[]} spans
  * @returns {ReturnType<typeof createTraceStore>}
  */
@@ -214,12 +270,11 @@ function sealIntoStore(spans) {
 }
 
 /**
- * @param {unknown} value
+ * @param {string} text
  * @param {string|undefined} out
  * @returns {void}
  */
-function writeJson(value, out) {
-  const text = `${JSON.stringify(value, null, 2)}\n`
+function writeText(text, out) {
   if (out === undefined || out === '-') {
     process.stdout.write(text)
     return
@@ -229,6 +284,15 @@ function writeJson(value, out) {
   } catch (error) {
     fail(`cannot write "${out}": ${messageOf(error)}`)
   }
+}
+
+/**
+ * @param {unknown} value
+ * @param {string|undefined} out
+ * @returns {void}
+ */
+function writeJson(value, out) {
+  writeText(`${JSON.stringify(value, null, 2)}\n`, out)
 }
 
 /**
@@ -245,6 +309,7 @@ export function main(argv = process.argv.slice(2)) {
         format: { type: 'string', default: 'bundle' },
         out: { type: 'string' },
         'service-name': { type: 'string' },
+        traceparent: { type: 'boolean' },
         help: { type: 'boolean', short: 'h' },
         version: { type: 'boolean', short: 'V' },
       },
@@ -282,8 +347,12 @@ export function main(argv = process.argv.slice(2)) {
   }
   const out = parsed.values.out
   const serviceName = parsed.values['service-name']
+  const withTraceparent = parsed.values.traceparent === true
 
   if (command === 'trace_export' || command === 'export') {
+    if (withTraceparent && format !== 'otlp') {
+      fail('--traceparent requires --format otlp for trace_export')
+    }
     const text = readText(input, 'input')
     const spans = readExportSpans(text, 'input')
     const store = sealIntoStore(spans)
@@ -294,7 +363,26 @@ export function main(argv = process.argv.slice(2)) {
       } catch (error) {
         fail(messageOf(error))
       }
-      writeJson(document, out)
+      if (withTraceparent) {
+        /** @type {string[]} */
+        const lines = []
+        try {
+          for (const entry of document.resourceSpans[0].scopeSpans[0].spans) {
+            lines.push(
+              formatTraceparent({
+                traceId: /** @type {string} */ (entry.traceId),
+                spanId: /** @type {string} */ (entry.spanId),
+                flags: typeof entry.flags === 'number' ? entry.flags : 1,
+              }),
+            )
+          }
+        } catch (error) {
+          fail(messageOf(error))
+        }
+        writeText(lines.length === 0 ? '' : `${lines.join('\n')}\n`, out)
+      } else {
+        writeJson(document, out)
+      }
     } else {
       writeJson(store.exportBundle(), out)
     }
@@ -302,10 +390,17 @@ export function main(argv = process.argv.slice(2)) {
   }
 
   if (input === undefined) fail('trace_import requires an input file (or "-" for stdin)')
+  if (withTraceparent && format === 'otlp') {
+    fail('--traceparent reads header lines; do not combine it with --format otlp')
+  }
   const text = readText(input, 'input')
   let spans
   try {
-    spans = format === 'otlp' ? fromOtlp(text) : readImportBundle(text, 'input')
+    if (withTraceparent) {
+      spans = readTraceparentSpans(text)
+    } else {
+      spans = format === 'otlp' ? fromOtlp(text) : readImportBundle(text, 'input')
+    }
   } catch (error) {
     fail(messageOf(error))
   }
