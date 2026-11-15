@@ -114,7 +114,7 @@ test('atomic replacement preserves the file mode and leaves no temp files behind
 
   assert.equal(await readText(root, 'bin/tool.txt'), 'new')
   const stat = await fs.stat(target)
-  assert.equal(stat.mode & 0o777, 0o640)
+  if (process.platform !== 'win32') assert.equal(stat.mode & 0o777, 0o640)
   const entries = await fs.readdir(absolute(root, 'bin'))
   assert.equal(
     entries.some((entry) => entry.includes('.dsh-os-lease-tmp-')),
