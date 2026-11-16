@@ -10,6 +10,7 @@
 # It requires `id-token: write`; the workflow only needs read access to contents.
 #
 # Token model (transitional): publishing authenticates with secrets.NPM_TOKEN.
+# Blocked 2026-11-16 on npm account 2FA; see docs/trusted-publishing.md.
 # TODO: migrate to npm Trusted Publishing (OIDC) and delete the secret:
 #   npmjs.com -> each package -> Settings -> Trusted Publishing -> GitHub Actions
 #   repository PerryLink/dsh-os-suite, workflow file release.yml

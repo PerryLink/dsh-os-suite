@@ -26,6 +26,8 @@ DSH already has the organs of an agent OS — sessions, tools, agent loop, sandb
 ## Status (2026-11-15)
 
 - **276/276 tests pass** (`npm test`; six packages).
+- **Branch protection**: `main` requires a PR, the CI/CodeQL checks, and an up-to-date branch; force pushes and deletion are blocked.
+- **Release auth**: `NPM_TOKEN` (transitional); trusted-publishing steps are in [`docs/trusted-publishing.md`](docs/trusted-publishing.md).
 - **Host-service integration**: four tests mount the real DSH `0.2.2-rc.3` service packages (Cordis Context, ToolRuntime, NativeToolExecutor, SessionStore, SessionQuery) and verify quota denial, trace spans, and eval live reads; run `npm run test:integration`.
 - **Coverage gate**: lines 85% / functions 80% / branches 70% (`npm run test:coverage`).
 - **21 tools** register through `defineTool`; all six entries import and `apply()` under a fake Cordis context.

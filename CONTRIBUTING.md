@@ -12,6 +12,11 @@ Please read [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) and [SECURITY.md](SECURITY.
 - External contributors do **not** need access to `04-build`. Open a pull request on GitHub; maintainers will apply the accepted change to the staging tree and re-sync.
 - `node_modules/`, `*.tgz`, `.DSH_HOME/`, and `*.log` are ignored. Do not commit them.
 
+
+## Branch protection
+
+`main` is protected: changes land through a pull request, the test matrix, `host-integration`, `dsh-smoke` and CodeQL must pass, and the branch must be up to date before merge. Force pushes and branch deletion are blocked. Create release tags on the merge commit after CI is green.
+
 ## Development environment
 
 - **Node.js** `^22.19.0 || >=24.9.0` (the `engines.node` range). The 0.1.1 audit ran on Node 24.22.1; if you test the lower bound, state the exact version in your PR.

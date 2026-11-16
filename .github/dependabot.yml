@@ -12,3 +12,8 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
+    # Actions are pinned to full commit SHAs; a major bump needs a manual
+    # review of the new action, not an automatic PR.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
