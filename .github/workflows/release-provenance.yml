@@ -1,0 +1,31 @@
+# Attach npm provenance attestations to the GitHub release as one
+# `.intoto.jsonl` asset. Scorecard's Signed-Releases check reads release asset
+# filenames, not GitHub's attestation API; this keeps the release verifiable.
+name: Release provenance
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  attach:
+    name: Attach .intoto.jsonl provenance
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '24'
+      - name: Attach npm provenance
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: node scripts/attach-release-provenance.mjs

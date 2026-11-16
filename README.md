@@ -27,6 +27,7 @@ DSH already has the organs of an agent OS — sessions, tools, agent loop, sandb
 
 - **276/276 tests pass** (`npm test`; six packages).
 - **Branch protection**: `main` requires a PR, the CI/CodeQL checks, and an up-to-date branch; force pushes and deletion are blocked.
+- **Release provenance**: published GitHub releases carry a `.intoto.jsonl` asset generated from npm attestations (manually for `v0.2.4`, automatically for future releases via `.github/workflows/release-provenance.yml`).
 - **Release auth**: `NPM_TOKEN` (transitional); trusted-publishing steps are in [`docs/trusted-publishing.md`](docs/trusted-publishing.md).
 - **Host-service integration**: five tests mount the real DSH `0.2.2-rc.3` service packages (Cordis Context, ToolRuntime, NativeToolExecutor, SessionStore, SessionProjectionRegistry, SessionQuery, TokenMeter) and verify quota denial, trace spans, eval live reads, and token-meter pressure; run `npm run test:integration`.
 - **Coverage gate**: lines 85% / functions 80% / branches 70% (`npm run test:coverage`).
