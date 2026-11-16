@@ -6,12 +6,15 @@ import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime, { defineTool } from '@deepseek-ai/dsh-tools'
 import * as NativeToolExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import SessionStore from '@deepseek-ai/dsh-session'
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import SessionQuery from '@deepseek-ai/dsh-session-query'
+import TokenMeter from '@deepseek-ai/dsh-token-meter'
 import { createGovernor } from '../../packages/dsh-os-quota/src/core.js'
 import { createEnforcer } from '../../packages/dsh-os-quota/src/enforce.js'
 import { createTraceStore } from '../../packages/dsh-os-trace/src/core.js'
 import { createIngest } from '../../packages/dsh-os-trace/src/ingest.js'
 import { readLiveSession } from '../../packages/dsh-os-eval/src/live.js'
+import { createPressureGuard } from '../../packages/dsh-os-quota/src/pressure.js'
 
 /**
  * These tests mount real `@deepseek-ai/*` services (Cordis Context, ToolRuntime,
@@ -202,4 +205,35 @@ test('eval reads a live session through the real SessionStore and SessionQuery',
   assert.equal(parsed.toolCalls[0].hasResult, true)
   assert.equal(parsed.toolCalls[0].isError, false)
   assert.equal(parsed.messages.at(-1).text, 'Read the README. All checks passed.')
+})
+
+test('quota pressure guard reads the real token-meter service', async (t) => {
+  const ctx = new Context()
+  await ctx.plugin(SessionStore)
+  await ctx.plugin(SessionProjectionRegistry)
+  await ctx.plugin(TokenMeter)
+  t.after(async () => { await ctx.fiber.dispose() })
+
+  const session = ctx.sessions.create()
+  session.append('step/start', { turn: 1, step: 1 })
+  session.append('request/context', { provider: 'mock', model: 'mock', contextWindow: 64_000 })
+  session.append('assistant/attempt', {
+    turn: 1,
+    step: 1,
+    stream: [{ type: 'chunk', time: 0, chunk: { type: 'usage', usage: { inputTokens: 100, outputTokens: 10 } } }],
+  })
+
+  const pressure = ctx.tokenMeter.contextPressure(session)
+  assert.equal(pressure.pressureTokens, 100)
+  assert.equal(pressure.contextWindow, 64_000)
+
+  const guard = createPressureGuard({ ctx, maxPressure: 50 })
+  assert.equal(guard.available, true)
+  const decision = guard.check({ session })
+  assert.equal(decision.kind, 'deny')
+  assert.equal(decision.reason, 'pressure')
+  assert.equal(guard.status().pressureTokens, 100)
+
+  const relaxed = createPressureGuard({ ctx, maxPressure: 100 })
+  assert.equal(relaxed.check({ session }).allow, true)
 })
