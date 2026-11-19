@@ -32,7 +32,8 @@ packages/dsh-os-trace/
   src/w3c.js    W3C traceparent 字符串：格式化/校验/辅助（不含传播）
   src/cli.js    离线 CLI：trace_export / trace_import（默认 v1 bundle）
   src/index.js  Cordis 插件：createTraceStore + 5 个 defineTool + 种子输入 + attach
-  test/         core / ingest / sign / otlp / w3c / cli / index 七组离线测试
+  test/         core / ingest / sign / otlp / w3c / cli / index / real-run 八组离线测试
+  test/fixtures/ 脱敏后的真实 run span（见 fixtures/README.md）
 ```
 
 数据流：
