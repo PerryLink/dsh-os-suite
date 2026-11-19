@@ -7,7 +7,7 @@
 >
 > Causal audit and tamper-evident evidence bundles for DSH agent runs.
 
-**状态：0.2.4 已包含实时事件采集、HMAC 签名、OTLP/JSON 导入导出与 W3C `traceparent` 字符串互操作；npm 上的 0.2.4 即这些能力。** 社区项目，非 DeepSeek 官方项目，Apache-2.0，无 SLA。
+**状态：0.2.5 已包含实时事件采集、HMAC 签名、OTLP/JSON 导入导出与 W3C `traceparent` 字符串互操作；npm 上的 0.2.5 即这些能力。** 社区项目，非 DeepSeek 官方项目，Apache-2.0，无 SLA。
 
 ## 为什么
 
