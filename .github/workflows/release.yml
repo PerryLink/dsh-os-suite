@@ -9,13 +9,12 @@
 # attestation visible via the registry (npm view <pkg>@<version> dist.attestations).
 # It requires `id-token: write`; the workflow only needs read access to contents.
 #
-# Token model (transitional): publishing authenticates with secrets.NPM_TOKEN.
-# Blocked 2026-11-16 on npm account 2FA; see docs/trusted-publishing.md.
-# TODO: migrate to npm Trusted Publishing (OIDC) and delete the secret:
-#   npmjs.com -> each package -> Settings -> Trusted Publishing -> GitHub Actions
-#   repository PerryLink/dsh-os-suite, workflow file release.yml
-# Then remove NODE_AUTH_TOKEN / secrets.NPM_TOKEN here. `id-token: write` stays,
-# because both provenance and trusted publishing use the OIDC token.
+# Auth: npm Trusted Publishing (OIDC). The maintainer configured the trusted
+# publisher for each of the six packages on npmjs.com (owner PerryLink,
+# repository PerryLink/dsh-os-suite, workflow release.yml, environment empty).
+# No NODE_AUTH_TOKEN or registry-url is used; `id-token: write` supplies the
+# OIDC token. The legacy NPM_TOKEN secret is retained until one tag release
+# verifies the OIDC path; see docs/trusted-publishing.md.
 name: Release
 
 on:
@@ -93,7 +92,6 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: '24'
-          registry-url: 'https://registry.npmjs.org'
 
       - name: Check tag matches every package version
         shell: bash
@@ -128,13 +126,7 @@ jobs:
           done
           echo "all workspace versions are unpublished"
 
-      - name: Publish workspaces with provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish workspaces with provenance (OIDC)
         run: |
           set -euo pipefail
-          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
-            echo "::error::secrets.NPM_TOKEN is empty; configure the npm publish token first"
-            exit 1
-          fi
           npm publish --workspaces --access public --provenance

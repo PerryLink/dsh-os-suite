@@ -1,10 +1,10 @@
 # npm Trusted Publishing (OIDC) — status and steps
 
-> **Status (2026-11-16): blocked on npm account 2FA.** The release workflows still
-> use the `NPM_TOKEN` secret. `npm trust github` was attempted for
-> `dsh-os-trace` and returned `E403`: the configured granular access token
-> bypasses 2FA, and npm refuses that token for trusted-publisher changes.
-> Do not remove `NPM_TOKEN` until all six packages are configured.
+> **Status (2026-11-19): repo side switched to OIDC.** The maintainer reports the
+> npm Trusted Publisher is configured for all six packages. The release workflow
+> no longer reads `NPM_TOKEN` or sets `registry-url`; `id-token: write` supplies
+> the OIDC token. The legacy `NPM_TOKEN` secret is retained only until one tag
+> release proves the OIDC path, then it should be deleted.
 
 ## Why
 
@@ -32,7 +32,7 @@ Packages:
 - `dsh-os-catalog`
 - `dsh-os-registry`
 
-## Then change the workflow
+## Workflow change (done 2026-11-19)
 
 In `.github/workflows/release.yml` publish job:
 
