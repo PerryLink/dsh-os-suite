@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.5] - 2026-11-19
+
+### Changed
+- Release publishing uses npm Trusted Publishing (OIDC); the publish job no longer reads `NPM_TOKEN` or sets `registry-url`.
+- Published GitHub releases carry a `.intoto.jsonl` npm provenance asset.
+
+### Added
+- Host-service integration test for the real DSH `TokenMeter` context-pressure seam (`createPressureGuard` deny/allow).
+
 ## [0.2.4] - 2026-11-15
 
 ### Fixed

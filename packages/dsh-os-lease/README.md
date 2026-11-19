@@ -37,7 +37,7 @@ when agents must share one workspace safely.
 
 ## Install
 
-The package is **published as `dsh-os-lease@0.2.4`**. From npm:
+The package is **published as `dsh-os-lease@0.2.5`**. From npm:
 
 ```sh
 npm install

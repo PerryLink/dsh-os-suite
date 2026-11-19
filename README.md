@@ -8,7 +8,7 @@
 Six small, composable **governance-layer** plugins for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH).
 
 > **Community project. Not affiliated with, sponsored by, or endorsed by DeepSeek.**
-> Apache-2.0. No SLA, no warranty. Early MVP, published as `0.2.4` on npm (2026-11-15).
+> Apache-2.0. No SLA, no warranty. Early MVP, published as `0.2.5` on npm (2026-11-19).
 
 DSH already has the organs of an agent OS — sessions, tools, agent loop, sandbox, approvals, jobs, teams, worktrees, MCP. What it lacks is the **nervous system**: who is running, what they consume, why something happened, how to resume after a crash, what can do X, and whether a change made things worse. These six packages target that layer, not another UI skin or file search.
 
@@ -27,7 +27,7 @@ DSH already has the organs of an agent OS — sessions, tools, agent loop, sandb
 
 - **276/276 tests pass** (`npm test`; six packages).
 - **Branch protection**: `main` requires a PR, the CI/CodeQL checks, and an up-to-date branch; force pushes and deletion are blocked.
-- **Release provenance**: published GitHub releases carry a `.intoto.jsonl` asset generated from npm attestations (manually for `v0.2.4`, automatically for future releases via `.github/workflows/release-provenance.yml`).
+- **Release provenance**: published GitHub releases carry a `.intoto.jsonl` asset generated from npm attestations (manually for `v0.2.4`+, automatically for future releases via `.github/workflows/release-provenance.yml`).
 - **Release auth**: npm Trusted Publishing (OIDC); the legacy `NPM_TOKEN` is retained only until one tag release verifies the OIDC path. Steps/history: [`docs/trusted-publishing.md`](docs/trusted-publishing.md).
 - **Host-service integration**: five tests mount the real DSH `0.2.2-rc.3` service packages (Cordis Context, ToolRuntime, NativeToolExecutor, SessionStore, SessionProjectionRegistry, SessionQuery, TokenMeter) and verify quota denial, trace spans, eval live reads, and token-meter pressure; run `npm run test:integration`.
 - **Coverage gate**: lines 85% / functions 80% / branches 70% (`npm run test:coverage`).
@@ -35,7 +35,7 @@ DSH already has the organs of an agent OS — sessions, tools, agent loop, sandb
 - **Names verified**: `npm view <name>` → E404; GitHub exact-name search → 0 (2026-11-15). See [NAME-CHECK.md](NAME-CHECK.md).
 - **Pre-release audit**: [AUDIT.md](AUDIT.md) (historical, 0.1.x); the three findings were fixed in 0.2.x.
 - **Real install verified** in an isolated `DSH_HOME`: all six tarballs install via `dsh plugin --profile web add`, and `--dump-config` lists all six entries.
-- **Published**: all six packages at `0.2.4` on npm (2026-11-15).
+- **Published**: all six packages at `0.2.5` on npm (2026-11-19).
 
 ## Install
 
