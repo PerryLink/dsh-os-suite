@@ -13,8 +13,8 @@
 # publisher for each of the six packages on npmjs.com (owner PerryLink,
 # repository PerryLink/dsh-os-suite, workflow release.yml, environment empty).
 # No NODE_AUTH_TOKEN or registry-url is used; `id-token: write` supplies the
-# OIDC token. The legacy NPM_TOKEN secret is retained until one tag release
-# verifies the OIDC path; see docs/trusted-publishing.md.
+# OIDC token. The OIDC path was verified by the v0.2.5 release; the legacy
+# NPM_TOKEN secret has been removed. See docs/trusted-publishing.md.
 name: Release
 
 on:

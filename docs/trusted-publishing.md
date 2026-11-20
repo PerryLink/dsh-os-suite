@@ -1,10 +1,9 @@
 # npm Trusted Publishing (OIDC) — status and steps
 
-> **Status (2026-11-19): repo side switched to OIDC.** The maintainer reports the
-> npm Trusted Publisher is configured for all six packages. The release workflow
-> no longer reads `NPM_TOKEN` or sets `registry-url`; `id-token: write` supplies
-> the OIDC token. The legacy `NPM_TOKEN` secret is retained only until one tag
-> release proves the OIDC path, then it should be deleted.
+> **Status (2026-11-20): OIDC verified.** The `v0.2.5` release published all
+> six packages through npm Trusted Publishing; each package has a provenance
+> attestation. The release workflow never reads `NPM_TOKEN` or sets
+> `registry-url`, and the legacy `NPM_TOKEN` secret has been deleted.
 
 ## Why
 
