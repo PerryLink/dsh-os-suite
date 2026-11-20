@@ -58,6 +58,7 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 
 ### Added
 
+- `dsh-os-trace`: anonymized real-run fixture (`packages/dsh-os-trace/test/fixtures/real-run-redacted.jsonl`, 637 spans across 3 sessions including a subagent child session) plus tests for ingest, the hash chain and `trace_why` over recorded DSH spans. Partial coverage of #1: no approval spans yet.
 - Repository hygiene documentation: `SECURITY.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `CHANGELOG.md`, and GitHub issue forms for bugs and features. Security reports are routed to private GitHub Security Advisories.
 - A `Security · Contributing · Changelog` navigation line at the top of the root README.
 
