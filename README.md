@@ -9,7 +9,7 @@
 
 **Six governance plugins for the layers [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) does not ship: causal trace, workspace leases, advisory quotas, eval gates, a capability catalog and a service registry.**
 
-*Who is running, what they consume, why something happened, how to resume after a crash, what can do X, and whether a change made things worse — 21 tools across six `defineTool` packages, offline core logic, 5 host-service integration tests, published as `0.2.5`.*
+*Who is running, what they consume, why something happened, how to resume after a crash, what can do X, and whether a change made things worse — 26 tools across six `defineTool` packages, offline core logic, 5 host-service integration tests, published as `0.2.5`.*
 
 [简体中文](README-zh.md) · [Español](README-es.md) · [Português](README-pt.md) · [हिन्दी](README-hi.md)
 
@@ -40,10 +40,10 @@ DSH already has the organs of an agent OS — sessions, tools, agent loop, sandb
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/dsh-os-suite-flow-v5-dark.svg">
-  <img src="docs/assets/dsh-os-suite-flow-v5-light.svg" width="100%" alt="dsh-os-suite structure: six packages register 21 tools through defineTool, DSH events become spans in a SHA-256 chain, and quota, lease, eval, catalog and registry decisions sit on the same read-only path">
+  <img src="docs/assets/dsh-os-suite-flow-v5-light.svg" width="100%" alt="dsh-os-suite structure: six packages register 26 tools through defineTool, DSH events become spans in a SHA-256 chain, and quota, lease, eval, catalog and registry decisions sit on the same read-only path">
 </picture>
 
-*Structure: six packages → 21 tools → one read-only layer; `trace_*` records the causal chain, `workspace_*` plans and applies multi-file changes, `quota_*` decides admission, `eval_*` gates against baselines, `capability_*` answers what can do X and `service_*` tracks local ports. The token labels inside the diagram are the real tool and package names, so the same picture serves all five languages.*
+*Structure: six packages → 26 tools → one read-only layer; `trace_*` records the causal chain, `workspace_*` plans and applies multi-file changes, `quota_*` decides admission, `eval_*` gates against baselines, `capability_*` answers what can do X and `service_*` tracks local ports. The token labels inside the diagram are the real tool and package names, so the same picture serves all five languages.*
 
 ## Status (2026-11-15)
 
@@ -53,7 +53,7 @@ DSH already has the organs of an agent OS — sessions, tools, agent loop, sandb
 - **Release auth**: npm Trusted Publishing (OIDC), verified by the `v0.2.5` release; the legacy `NPM_TOKEN` secret has been removed. Steps/history: [`docs/trusted-publishing.md`](docs/trusted-publishing.md).
 - **Host-service integration**: five tests mount the real DSH `0.2.2-rc.3` service packages (Cordis Context, ToolRuntime, NativeToolExecutor, SessionStore, SessionProjectionRegistry, SessionQuery, TokenMeter) and verify quota denial, trace spans, eval live reads, and token-meter pressure; run `npm run test:integration`.
 - **Coverage gate**: lines 85% / functions 80% / branches 70% (`npm run test:coverage`).
-- **21 tools** register through `defineTool`; all six entries import and `apply()` under a fake Cordis context.
+- **26 tools** register through `defineTool`; all six entries import and `apply()` under a fake Cordis context.
 - **Names verified**: `npm view <name>` → E404; GitHub exact-name search → 0 (2026-11-15). See [NAME-CHECK.md](NAME-CHECK.md).
 - **Pre-release audit**: [AUDIT.md](AUDIT.md) (historical, 0.1.x); the three findings were fixed in 0.2.x.
 - **Real install verified** in an isolated `DSH_HOME`: all six tarballs install via `dsh plugin --profile web add`, and `--dump-config` lists all six entries.
