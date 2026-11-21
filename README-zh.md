@@ -9,7 +9,7 @@
 
 **DSH（[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)）缺的那一层，由六个治理插件补上：因果审计、工作区租约、建议性配额、评测门禁、能力目录与服务登记。**
 
-*谁在跑、消耗了什么、为什么发生、崩了怎么续、谁能做 X、一次改动有没有让事情变糟 —— 六个 `defineTool` 包共 21 个工具，核心逻辑离线可测，另有 5 项宿主服务集成测试，已发布 `0.2.5`。*
+*谁在跑、消耗了什么、为什么发生、崩了怎么续、谁能做 X、一次改动有没有让事情变糟 —— 六个 `defineTool` 包共 26 个工具，核心逻辑离线可测，另有 5 项宿主服务集成测试，已发布 `0.2.5`。*
 
 [English](README.md) · **简体中文** · [Español](README-es.md) · [Português](README-pt.md) · [हिन्दी](README-hi.md)
 
@@ -40,10 +40,10 @@ DSH 已经具备 Agent OS 的器官 —— session、工具、agent 循环、沙
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/dsh-os-suite-flow-v5-dark.svg">
-  <img src="docs/assets/dsh-os-suite-flow-v5-light.svg" width="100%" alt="dsh-os-suite 结构图：六个包通过 defineTool 注册 21 个工具，DSH 事件变成 SHA-256 链上的 span，配额、租约、评测、目录与登记决策都走同一条只读路径">
+  <img src="docs/assets/dsh-os-suite-flow-v5-light.svg" width="100%" alt="dsh-os-suite 结构图：六个包通过 defineTool 注册 26 个工具，DSH 事件变成 SHA-256 链上的 span，配额、租约、评测、目录与登记决策都走同一条只读路径">
 </picture>
 
-*结构：六个包 → 21 个工具 → 一层只读视图；`trace_*` 记录因果链，`workspace_*` 规划并应用多文件改动，`quota_*` 决定准入，`eval_*` 对照基线做门禁，`capability_*` 回答谁能做 X，`service_*` 追踪本地端口。图内只有真实的工具名与包名，五语共用同一张结构图。*
+*结构：六个包 → 26 个工具 → 一层只读视图；`trace_*` 记录因果链，`workspace_*` 规划并应用多文件改动，`quota_*` 决定准入，`eval_*` 对照基线做门禁，`capability_*` 回答谁能做 X，`service_*` 追踪本地端口。图内只有真实的工具名与包名，五语共用同一张结构图。*
 
 ## 状态（2026-11-15）
 
@@ -53,7 +53,7 @@ DSH 已经具备 Agent OS 的器官 —— session、工具、agent 循环、沙
 - **发布鉴权**：npm Trusted Publishing（OIDC），`v0.2.5` release 已验证；旧的 `NPM_TOKEN` secret 已移除。步骤与历史见 [`docs/trusted-publishing.md`](docs/trusted-publishing.md)。
 - **宿主服务集成**：五项测试挂载真实 DSH `0.2.2-rc.3` 服务包（Cordis Context、ToolRuntime、NativeToolExecutor、SessionStore、SessionProjectionRegistry、SessionQuery、TokenMeter），验证配额拒绝、trace span、eval 实时读取与 token-meter 压力；运行 `npm run test:integration`。
 - **覆盖率门禁**：行 85% / 函数 80% / 分支 70%（`npm run test:coverage`）。
-- **21 个工具**通过 `defineTool` 注册；六个入口都能在 fake Cordis context 下 import 并 `apply()`。
+- **26 个工具**通过 `defineTool` 注册；六个入口都能在 fake Cordis context 下 import 并 `apply()`。
 - **命名已核验**：`npm view <name>` → E404；GitHub 精确名搜索 → 0（2026-11-15）。见 [NAME-CHECK.md](NAME-CHECK.md)。
 - **发布前审计**：[AUDIT.md](AUDIT.md)（历史，0.1.x）；三项发现在 0.2.x 已修复。
 - **真实安装已验证**：在隔离的 `DSH_HOME` 中，六个 tarball 都可通过 `dsh plugin --profile web add` 安装，`--dump-config` 列出全部六个条目。

@@ -9,7 +9,7 @@
 
 **Seis plugins de gobernanza para las capas que [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) no trae: traza causal, leases de espacio de trabajo, cuotas consultivas, puertas de evaluación, catálogo de capacidades y registro de servicios.**
 
-*Quién está corriendo, qué consume, por qué ocurrió algo, cómo reanudar tras un fallo, qué puede hacer X y si un cambio empeoró las cosas — 21 herramientas en seis paquetes con `defineTool`, lógica central sin red, 5 pruebas de integración con servicios del host, publicado como `0.2.5`.*
+*Quién está corriendo, qué consume, por qué ocurrió algo, cómo reanudar tras un fallo, qué puede hacer X y si un cambio empeoró las cosas — 26 herramientas en seis paquetes con `defineTool`, lógica central sin red, 5 pruebas de integración con servicios del host, publicado como `0.2.5`.*
 
 [English](README.md) · [简体中文](README-zh.md) · **Español** · [Português](README-pt.md) · [हिन्दी](README-hi.md)
 
@@ -40,10 +40,10 @@ DSH ya tiene los órganos de un agent OS — sesiones, herramientas, bucle del a
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/dsh-os-suite-flow-v5-dark.svg">
-  <img src="docs/assets/dsh-os-suite-flow-v5-light.svg" width="100%" alt="dsh-os-suite estructura: seis paquetes registran 21 herramientas vía defineTool, los eventos de DSH se convierten en spans de una cadena SHA-256, y las decisiones de cuota, lease, eval, catálogo y registro viven en la misma ruta de solo lectura">
+  <img src="docs/assets/dsh-os-suite-flow-v5-light.svg" width="100%" alt="dsh-os-suite estructura: seis paquetes registran 26 herramientas vía defineTool, los eventos de DSH se convierten en spans de una cadena SHA-256, y las decisiones de cuota, lease, eval, catálogo y registro viven en la misma ruta de solo lectura">
 </picture>
 
-*Estructura: seis paquetes → 21 herramientas → una capa de solo lectura; `trace_*` registra la cadena causal, `workspace_*` planifica y aplica cambios multiarchivo, `quota_*` decide la admisión, `eval_*` pone la puerta contra líneas base, `capability_*` responde qué puede hacer X y `service_*` rastrea puertos locales. Las etiquetas del diagrama son los nombres reales de herramientas y paquetes, así que la misma imagen sirve a los cinco idiomas.*
+*Estructura: seis paquetes → 26 herramientas → una capa de solo lectura; `trace_*` registra la cadena causal, `workspace_*` planifica y aplica cambios multiarchivo, `quota_*` decide la admisión, `eval_*` pone la puerta contra líneas base, `capability_*` responde qué puede hacer X y `service_*` rastrea puertos locales. Las etiquetas del diagrama son los nombres reales de herramientas y paquetes, así que la misma imagen sirve a los cinco idiomas.*
 
 ## Estado (2026-11-15)
 
@@ -53,7 +53,7 @@ DSH ya tiene los órganos de un agent OS — sesiones, herramientas, bucle del a
 - **Autenticación del release**: npm Trusted Publishing (OIDC), verificado con el release `v0.2.5`; el secret `NPM_TOKEN` heredado ya se eliminó. Pasos e historial: [`docs/trusted-publishing.md`](docs/trusted-publishing.md).
 - **Integración con servicios del host**: cinco pruebas montan los paquetes reales de servicio de DSH `0.2.2-rc.3` (Cordis Context, ToolRuntime, NativeToolExecutor, SessionStore, SessionProjectionRegistry, SessionQuery, TokenMeter) y verifican la denegación de cuota, los spans de traza, las lecturas en vivo de eval y la presión del token-meter; ejecuta `npm run test:integration`.
 - **Puerta de cobertura**: líneas 85%, funciones 80%, ramas 70% (`npm run test:coverage`).
-- **21 herramientas** se registran vía `defineTool`; las seis entradas importan y hacen `apply()` bajo un contexto Cordis falso.
+- **26 herramientas** se registran vía `defineTool`; las seis entradas importan y hacen `apply()` bajo un contexto Cordis falso.
 - **Nombres verificados**: `npm view <name>` → E404; búsqueda exacta de nombre en GitHub → 0 (2026-11-15). Ver [NAME-CHECK.md](NAME-CHECK.md).
 - **Auditoría previa al release**: [AUDIT.md](AUDIT.md) (histórico, 0.1.x); los tres hallazgos se corrigieron en 0.2.x.
 - **Instalación real verificada** en un `DSH_HOME` aislado: los seis tarballs se instalan vía `dsh plugin --profile web add`, y `--dump-config` lista las seis entradas.
