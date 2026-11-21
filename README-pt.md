@@ -9,7 +9,7 @@
 
 **Seis plugins de governança para as camadas que o [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) não traz: rastreamento causal, leases de workspace, cotas consultivas, portões de avaliação, catálogo de capacidades e registro de serviços.**
 
-*Quem está rodando, o que consome, por que algo aconteceu, como retomar depois de uma queda, o que pode fazer X e se uma mudança piorou as coisas — 21 ferramentas em seis pacotes com `defineTool`, lógica central offline, 5 testes de integração com serviços do host, publicado como `0.2.5`.*
+*Quem está rodando, o que consome, por que algo aconteceu, como retomar depois de uma queda, o que pode fazer X e se uma mudança piorou as coisas — 26 ferramentas em seis pacotes com `defineTool`, lógica central offline, 5 testes de integração com serviços do host, publicado como `0.2.5`.*
 
 [English](README.md) · [简体中文](README-zh.md) · [Español](README-es.md) · **Português** · [हिन्दी](README-hi.md)
 
@@ -40,10 +40,10 @@ O DSH já tem os órgãos de um agent OS — sessões, ferramentas, loop do agen
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/dsh-os-suite-flow-v5-dark.svg">
-  <img src="docs/assets/dsh-os-suite-flow-v5-light.svg" width="100%" alt="dsh-os-suite estrutura: seis pacotes registram 21 ferramentas via defineTool, eventos do DSH viram spans de uma cadeia SHA-256, e as decisões de cota, lease, eval, catálogo e registro ficam na mesma rota somente leitura">
+  <img src="docs/assets/dsh-os-suite-flow-v5-light.svg" width="100%" alt="dsh-os-suite estrutura: seis pacotes registram 26 ferramentas via defineTool, eventos do DSH viram spans de uma cadeia SHA-256, e as decisões de cota, lease, eval, catálogo e registro ficam na mesma rota somente leitura">
 </picture>
 
-*Estrutura: seis pacotes → 21 ferramentas → uma camada somente leitura; `trace_*` registra a cadeia causal, `workspace_*` planeja e aplica mudanças multiarquivo, `quota_*` decide a admissão, `eval_*` faz o portão contra linhas de base, `capability_*` responde o que pode fazer X e `service_*` acompanha portas locais. Os rótulos do diagrama são os nomes reais de ferramentas e pacotes, então a mesma imagem serve aos cinco idiomas.*
+*Estrutura: seis pacotes → 26 ferramentas → uma camada somente leitura; `trace_*` registra a cadeia causal, `workspace_*` planeja e aplica mudanças multiarquivo, `quota_*` decide a admissão, `eval_*` faz o portão contra linhas de base, `capability_*` responde o que pode fazer X e `service_*` acompanha portas locais. Os rótulos do diagrama são os nomes reais de ferramentas e pacotes, então a mesma imagem serve aos cinco idiomas.*
 
 ## Status (2026-11-15)
 
@@ -53,7 +53,7 @@ O DSH já tem os órgãos de um agent OS — sessões, ferramentas, loop do agen
 - **Autenticação do release**: npm Trusted Publishing (OIDC), verificado no release `v0.2.5`; o secret legado `NPM_TOKEN` foi removido. Passos e histórico: [`docs/trusted-publishing.md`](docs/trusted-publishing.md).
 - **Integração com serviços do host**: cinco testes montam os pacotes reais de serviço do DSH `0.2.2-rc.3` (Cordis Context, ToolRuntime, NativeToolExecutor, SessionStore, SessionProjectionRegistry, SessionQuery, TokenMeter) e verificam negação de cota, spans de trace, leituras ao vivo do eval e pressão do token-meter; rode `npm run test:integration`.
 - **Portão de cobertura**: linhas 85% / funções 80% / branches 70% (`npm run test:coverage`).
-- **21 ferramentas** se registram via `defineTool`; as seis entradas importam e fazem `apply()` sob um contexto Cordis falso.
+- **26 ferramentas** se registram via `defineTool`; as seis entradas importam e fazem `apply()` sob um contexto Cordis falso.
 - **Nomes verificados**: `npm view <name>` → E404; busca exata de nome no GitHub → 0 (2026-11-15). Ver [NAME-CHECK.md](NAME-CHECK.md).
 - **Auditoria pré-release**: [AUDIT.md](AUDIT.md) (histórico, 0.1.x); os três achados foram corrigidos em 0.2.x.
 - **Instalação real verificada** em um `DSH_HOME` isolado: os seis tarballs instalam via `dsh plugin --profile web add`, e `--dump-config` lista as seis entradas.
