@@ -1,16 +1,30 @@
+<div align="center">
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/dsh-os-suite-hero-en-dark.webp">
+  <img src="docs/assets/dsh-os-suite-hero-en-light.webp" width="100%" alt="dsh-os-suite: six governance plugins for DSH — a real 637-span fixture verifies into one SHA-256 chain with 637 checks and no bad span, and trace_why explains the recorded error turn with 36 edges and 37 spans">
+</picture>
+
 # dsh-os-suite
 
+**Six governance plugins for the layers [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) does not ship: causal trace, workspace leases, advisory quotas, eval gates, a capability catalog and a service registry.**
+
+*Who is running, what they consume, why something happened, how to resume after a crash, what can do X, and whether a change made things worse — 21 tools across six `defineTool` packages, offline core logic, 5 host-service integration tests, published as `0.2.5`.*
+
+[简体中文](README-zh.md) · [Español](README-es.md) · [Português](README-pt.md) · [हिन्दी](README-hi.md)
+
 [![CI](https://github.com/PerryLink/dsh-os-suite/actions/workflows/ci.yml/badge.svg)](https://github.com/PerryLink/dsh-os-suite/actions/workflows/ci.yml)
-
-
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [Security](SECURITY.md) · [Contributing](CONTRIBUTING.md) · [Changelog](CHANGELOG.md)
 
-Six small, composable **governance-layer** plugins for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH).
+</div>
 
 > **Community project. Not affiliated with, sponsored by, or endorsed by DeepSeek.**
 > Apache-2.0. No SLA, no warranty. Early MVP, published as `0.2.5` on npm (2026-11-19).
 
 DSH already has the organs of an agent OS — sessions, tools, agent loop, sandbox, approvals, jobs, teams, worktrees, MCP. What it lacks is the **nervous system**: who is running, what they consume, why something happened, how to resume after a crash, what can do X, and whether a change made things worse. These six packages target that layer, not another UI skin or file search.
+
+---
 
 ## Packages
 
@@ -22,6 +36,14 @@ DSH already has the organs of an agent OS — sessions, tools, agent loop, sandb
 | [`dsh-os-eval`](packages/dsh-os-eval/) | Regression eval gates: cases, baselines, CI verdicts | `eval_run`, `eval_gate`, `eval_report` |
 | [`dsh-os-catalog`](packages/dsh-os-catalog/) | Intent-based capability catalog for tools/plugins/MCP | `capability_search`, `capability_preflight`, `capability_register` |
 | [`dsh-os-registry`](packages/dsh-os-registry/) | Local service & port registry for dev servers | `service_register`, `service_list`, `service_stop` |
+
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/dsh-os-suite-flow-v5-dark.svg">
+  <img src="docs/assets/dsh-os-suite-flow-v5-light.svg" width="100%" alt="dsh-os-suite structure: six packages register 21 tools through defineTool, DSH events become spans in a SHA-256 chain, and quota, lease, eval, catalog and registry decisions sit on the same read-only path">
+</picture>
+
+*Structure: six packages → 21 tools → one read-only layer; `trace_*` records the causal chain, `workspace_*` plans and applies multi-file changes, `quota_*` decides admission, `eval_*` gates against baselines, `capability_*` answers what can do X and `service_*` tracks local ports. The token labels inside the diagram are the real tool and package names, so the same picture serves all five languages.*
 
 ## Status (2026-11-15)
 
@@ -49,6 +71,11 @@ dsh plugin --profile web add dsh-os-registry
 ```
 
 ## Quick start
+
+![dsh-os-suite test run: the real `node --test --test-reporter=tap` output over six packages (288 tests, 288 pass, 0 fail, including the 637-span real-run fixture and trace_why), then the 5 host-service integration tests and `npm run check:docs`](docs/assets/dsh-os-suite-demo.gif)
+
+*Animated: the real terminal output of the test commands in this checkout on 2026-11-21 — `node --test --test-reporter=tap` over the six packages (288 tests, the suite `npm test` runs), the integration tests (5) and `npm run check:docs`. The status section keeps its 2026-11-15 snapshot.*
+
 
 ```sh
 npm install
